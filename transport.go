@@ -21,6 +21,7 @@ func init() {
 
 type Transport struct {
 	ServerName string `json:"server_name,omitempty"`
+	Plaintext  bool   `json:"plaintext,omitempty"`
 
 	node      *serviceNode
 	transport *http.Transport
@@ -37,6 +38,11 @@ func (transport *Transport) UnmarshalCaddyfile(dispenser *caddyfile.Dispenser) e
 	for dispenser.Next() {
 		for dispenser.NextBlock(0) {
 			switch dispenser.Val() {
+			case "plaintext":
+				if dispenser.NextArg() {
+					return dispenser.ArgErr()
+				}
+				transport.Plaintext = true
 			case "tls_server_name":
 				if !dispenser.AllArgs(&transport.ServerName) {
 					return dispenser.ArgErr()
@@ -64,29 +70,33 @@ func (transport *Transport) Provision(_ caddy.Context) error {
 	}
 
 	transport.node = node.(*serviceNode)
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: transport.ServerName}
 	transport.transport = &http.Transport{
-		DialContext: transport.node.Dial,
-		DialTLSContext: func(
-			context context.Context,
-			network string,
-			address string,
-		) (net.Conn, error) {
-			connection, dialError := transport.node.Dial(context, network, address)
-			if dialError != nil {
-				return nil, dialError
-			}
-
-			secureConnection := tls.Client(connection, tlsConfig)
-			if handshakeError := secureConnection.HandshakeContext(context); handshakeError != nil {
-				_ = connection.Close()
-
-				return nil, handshakeError
-			}
-
-			return secureConnection, nil
-		},
+		DialContext:       transport.node.Dial,
 		ForceAttemptHTTP2: true,
+	}
+	if transport.Plaintext {
+		return nil
+	}
+
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: transport.ServerName}
+	transport.transport.DialTLSContext = func(
+		context context.Context,
+		network string,
+		address string,
+	) (net.Conn, error) {
+		connection, dialError := transport.node.Dial(context, network, address)
+		if dialError != nil {
+			return nil, dialError
+		}
+
+		secureConnection := tls.Client(connection, tlsConfig)
+		if handshakeError := secureConnection.HandshakeContext(context); handshakeError != nil {
+			_ = connection.Close()
+
+			return nil, handshakeError
+		}
+
+		return secureConnection, nil
 	}
 
 	return nil
@@ -106,6 +116,9 @@ func (transport *Transport) RoundTrip(request *http.Request) (*http.Response, er
 	upstreamRequest := request.Clone(request.Context())
 	upstreamURL := *request.URL
 	upstreamURL.Scheme = "https"
+	if transport.Plaintext {
+		upstreamURL.Scheme = "http"
+	}
 	upstreamRequest.URL = &upstreamURL
 
 	return transport.transport.RoundTrip(upstreamRequest)
@@ -120,7 +133,7 @@ var (
 )
 
 func (transport *Transport) TLSEnabled() bool {
-	return true
+	return !transport.Plaintext
 }
 
 func (transport *Transport) EnableTLS(_ *reverseproxy.TLSConfig) error {
