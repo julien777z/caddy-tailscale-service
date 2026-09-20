@@ -233,7 +233,7 @@ func (node *serviceNode) publishServiceAddresses(
 }
 
 func createServiceNode(name string) (*serviceNode, error) {
-	clientSecret := os.Getenv("TS_CLIENT_SECRET")
+	clientSecret := os.Getenv("TS_OAUTH_SECRET")
 	if clientSecret == "" {
 		return nil, fmt.Errorf("Tailscale OAuth client secret is required")
 	}

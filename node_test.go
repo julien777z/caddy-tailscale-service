@@ -14,7 +14,7 @@ import (
 func TestCreateServiceNodeUsesDedicatedKeyAndNormalizedTags(t *testing.T) {
 	t.Setenv("TS_ADVERTISE_TAGS", "tag:ci tag:gateway")
 
-	t.Setenv("TS_CLIENT_SECRET", "tskey-client-service")
+	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
 	node, err := createServiceNode("service-node")
 	if err != nil {
 		t.Fatalf("createServiceNode returned an error: %v", err)
@@ -33,7 +33,7 @@ func TestCreateServiceNodeUsesDedicatedKeyAndNormalizedTags(t *testing.T) {
 }
 
 func TestCreateServiceNodeSeparatesStateByHostname(t *testing.T) {
-	t.Setenv("TS_CLIENT_SECRET", "tskey-client-service")
+	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
 	serviceNode, err := createServiceNode("service-node")
 	if err != nil {
 		t.Fatalf("createServiceNode returned an error: %v", err)
@@ -52,7 +52,7 @@ func TestCreateServiceNodeSeparatesStateByHostname(t *testing.T) {
 func TestCreateServiceNodeRequiresClientSecret(t *testing.T) {
 	t.Setenv("TS_ADVERTISE_TAGS", "tag:ci")
 
-	t.Setenv("TS_CLIENT_SECRET", "")
+	t.Setenv("TS_OAUTH_SECRET", "")
 	_, err := createServiceNode("service-node")
 	if err == nil {
 		t.Fatal("createServiceNode accepted an empty OAuth client secret")
