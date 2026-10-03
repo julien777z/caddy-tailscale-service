@@ -1,0 +1,27 @@
+name: Check Module
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check Formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Test Module
+        run: go test -race ./...
+      - name: Vet Module
+        run: go vet ./...
+      - name: Build Caddy
+        run: docker build .
