@@ -65,7 +65,8 @@ tailscale_identity {
 }
 ```
 
-Use `tailscale_readiness` on a health endpoint to wait for the configured nodes during provisioning.
+Use `tailscale_readiness` on a health endpoint to wait for the configured nodes during provisioning
+and return HTTP 503 until the service has an active primary route.
 
 ## Configuration
 
@@ -80,8 +81,11 @@ Use `tailscale_readiness` on a health endpoint to wait for the configured nodes 
 | `TAILSCALE_SERVICES_FILE` | Optional path for published IPv4 service addresses, refreshed every minute. |
 | `TAILSCALE_IDENTITY_STRIP_HEADERS` | Additional space-separated headers stripped by identity handlers. |
 
-Paired nodes start concurrently within one 60-second deadline. Initial service-address publication
-uses the same deadline. Explicit-service transports use a dedicated outbound node named after the
+Paired nodes start concurrently within one 60-second deadline. Service listeners register without
+waiting for route activation, allowing every configured port to be advertised. The health endpoint
+requires an active primary route independently of optional file publication. Optional publication
+waits up to 60 seconds for that route and refreshes the file every minute. Explicit-service transports use a dedicated
+outbound node named after the
 service node with `-outbound` appended and retry once after a dial timeout, unless the request was
 cancelled. Direct identity handling clears supplied Tailscale identity and capability headers;
 trusted-proxy handling preserves identity only after verifying the caller's tag and a user login.

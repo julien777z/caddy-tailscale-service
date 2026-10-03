@@ -28,6 +28,8 @@ func proxyIdentity() *apitype.WhoIsResponse {
 	return &apitype.WhoIsResponse{Node: &tailcfg.Node{Tags: []string{"tag:proxy"}}}
 }
 
+const publicationServiceName tailcfg.ServiceName = "svc:example"
+
 func publicationClient(t *testing.T, routed bool) *local.Client {
 	t.Helper()
 	routes := views.SliceOf([]netip.Prefix{})
@@ -35,7 +37,7 @@ func publicationClient(t *testing.T, routed bool) *local.Client {
 		routes = views.SliceOf([]netip.Prefix{netip.MustParsePrefix("100.64.0.10/32")})
 	}
 	services := map[tailcfg.ServiceName]tailcfg.ServiceDetails{
-		"svc:example": {Name: "svc:example", Addrs: []netip.Addr{netip.MustParseAddr("100.64.0.10")}},
+		publicationServiceName: {Name: publicationServiceName, Addrs: []netip.Addr{netip.MustParseAddr("100.64.0.10")}},
 	}
 	status := &ipnstate.Status{Self: &ipnstate.PeerStatus{PrimaryRoutes: &routes}}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
