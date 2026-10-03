@@ -110,11 +110,7 @@ func getServiceListener(
 	}
 
 	if path := os.Getenv("TAILSCALE_SERVICES_FILE"); path != "" {
-		if err := serviceNode.publishServiceAddresses(path, serviceName); err != nil {
-			_, listenerErr := serviceListeners.Delete(listenerKey)
-
-			return nil, errors.Join(err, listenerErr, releaseGatewayTailscaleNodes(serviceNodeName, upstreamNodeName))
-		}
+		serviceNode.publishServiceAddresses(path, serviceName)
 	}
 
 	nodes.active.Store(true)
@@ -669,18 +665,16 @@ func ipv4ServiceAddresses(
 func (node *serviceNode) publishServiceAddresses(
 	path string,
 	serviceName string,
-) error {
+) {
 	node.publisherMu.Lock()
 	defer node.publisherMu.Unlock()
 
 	if node.publisherCancel != nil {
-		return nil
+		return
 	}
 
-	client, err := node.LocalClient()
-	if err != nil {
-		return err
-	}
+	// Node provisioning has completed Up, which initializes and retains this client.
+	client, _ := node.LocalClient()
 
 	publisherContext, cancel := context.WithCancel(context.Background())
 	node.publisherCancel = cancel
@@ -735,7 +729,6 @@ func (node *serviceNode) publishServiceAddresses(
 		}
 	}()
 
-	return nil
 }
 
 func serviceProxyProtocol(port uint16) (int, error) {
