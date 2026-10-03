@@ -32,12 +32,29 @@ func TestIPv4ServiceAddressesSelectsIPv4Addresses(t *testing.T) {
 }
 
 func TestPublicationRequiresPrimaryRoute(t *testing.T) {
-	for _, routed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("routed=%t", routed), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "services.json")
-			published, err := writeServiceAddresses(context.Background(), publicationClient(t, routed), path, "svc:example")
+	for _, scenario := range []struct {
+		routed  bool
+		publish bool
+	}{
+		{routed: false, publish: false},
+		{routed: true, publish: false},
+		{routed: false, publish: true},
+		{routed: true, publish: true},
+	} {
+		t.Run(fmt.Sprintf("routed=%t,publish=%t", scenario.routed, scenario.publish), func(t *testing.T) {
+			routed := scenario.routed
+			path := ""
+			if scenario.publish {
+				path = filepath.Join(t.TempDir(), "services.json")
+			}
+
+			published, err := writeServiceAddresses(context.Background(), publicationClient(t, routed), path, string(publicationServiceName))
 			if err != nil || published != routed {
 				t.Fatalf("published=%t error=%v, want %t", published, err, routed)
+			}
+
+			if !scenario.publish {
+				return
 			}
 
 			contents, readErr := os.ReadFile(path)
@@ -45,8 +62,10 @@ func TestPublicationRequiresPrimaryRoute(t *testing.T) {
 				if !errors.Is(readErr, os.ErrNotExist) {
 					t.Fatalf("unrouted service was published: %v", readErr)
 				}
+
 				return
 			}
+
 			if readErr != nil {
 				t.Fatal(readErr)
 			}
@@ -55,7 +74,8 @@ func TestPublicationRequiresPrimaryRoute(t *testing.T) {
 			if err := json.Unmarshal(contents, &addresses); err != nil {
 				t.Fatal(err)
 			}
-			if addresses["svc:example"] != "100.64.0.10" {
+
+			if addresses[string(publicationServiceName)] != "100.64.0.10" {
 				t.Fatalf("published addresses=%v", addresses)
 			}
 		})

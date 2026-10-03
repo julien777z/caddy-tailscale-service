@@ -109,9 +109,10 @@ func getServiceListener(
 		return nil, errors.Join(err, cleanupErr)
 	}
 
-	if servicesFile := os.Getenv("TAILSCALE_SERVICES_FILE"); servicesFile != "" {
-		if err := serviceNode.publishServiceAddresses(startupContext, servicesFile, serviceName); err != nil {
+	if path := os.Getenv("TAILSCALE_SERVICES_FILE"); path != "" {
+		if err := serviceNode.publishServiceAddresses(path, serviceName); err != nil {
 			_, listenerErr := serviceListeners.Delete(listenerKey)
+
 			return nil, errors.Join(err, listenerErr, releaseGatewayTailscaleNodes(serviceNodeName, upstreamNodeName))
 		}
 	}
@@ -317,6 +318,8 @@ func gatewayTailscaleNodeNames() (string, string, error) {
 }
 
 type Readiness struct {
+	client           *local.Client
+	serviceName      string
 	serviceNodeName  string
 	upstreamNodeName string
 }
@@ -356,9 +359,14 @@ func (readiness *Readiness) Provision(ctx caddy.Context) error {
 		return err
 	}
 
-	if _, err := loadReadyGatewayTailscaleNodes(ctx, serviceNodeName, upstreamNodeName); err != nil {
+	nodes, err := loadReadyGatewayTailscaleNodes(ctx, serviceNodeName, upstreamNodeName)
+	if err != nil {
 		return err
 	}
+
+	// Up completed Start, so LocalClient is guaranteed to succeed.
+	readiness.client, _ = nodes.service.LocalClient()
+	readiness.serviceName = os.Getenv("TAILSCALE_SERVICE_NAME")
 
 	readiness.serviceNodeName = serviceNodeName
 	readiness.upstreamNodeName = upstreamNodeName
@@ -374,11 +382,20 @@ func (readiness *Readiness) Cleanup() error {
 	return releaseGatewayTailscaleNodes(readiness.serviceNodeName, readiness.upstreamNodeName)
 }
 
-func (Readiness) ServeHTTP(
+func (readiness Readiness) ServeHTTP(
 	w http.ResponseWriter,
 	r *http.Request,
 	next caddyhttp.Handler,
 ) error {
+	ready, err := writeServiceAddresses(r.Context(), readiness.client, "", readiness.serviceName)
+	if err != nil {
+		return caddyhttp.Error(http.StatusServiceUnavailable, err)
+	}
+
+	if !ready {
+		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("Tailscale service route is not active"))
+	}
+
 	return next.ServeHTTP(w, r)
 }
 
@@ -612,6 +629,10 @@ func writeServiceAddresses(
 		return false, nil
 	}
 
+	if path == "" {
+		return true, nil
+	}
+
 	contents, _ := json.Marshal(addresses)
 
 	temporaryPath := path + ".tmp"
@@ -646,7 +667,6 @@ func ipv4ServiceAddresses(
 }
 
 func (node *serviceNode) publishServiceAddresses(
-	ctx context.Context,
 	path string,
 	serviceName string,
 ) error {
@@ -662,28 +682,33 @@ func (node *serviceNode) publishServiceAddresses(
 		return err
 	}
 
-	ticker := time.NewTicker(servicePublicationInterval)
-	defer ticker.Stop()
-
-	for {
-		published, err := writeServiceAddresses(ctx, client, path, serviceName)
-		if err != nil {
-			return err
-		}
-		if published {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-
 	publisherContext, cancel := context.WithCancel(context.Background())
 	node.publisherCancel = cancel
 	go func() {
+		startupContext, startupCancel := context.WithTimeout(publisherContext, servicePublicationTimeout)
+		defer startupCancel()
+		startupTicker := time.NewTicker(servicePublicationInterval)
+		defer startupTicker.Stop()
+
+		for {
+			published, err := writeServiceAddresses(startupContext, client, path, serviceName)
+			if err != nil {
+				caddy.Log().Error("publish Tailscale service addresses", zap.Error(err))
+				return
+			}
+
+			if published {
+				break
+			}
+
+			select {
+			case <-startupContext.Done():
+				caddy.Log().Error("publish Tailscale service addresses", zap.Error(startupContext.Err()))
+				return
+			case <-startupTicker.C:
+			}
+		}
+
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 
