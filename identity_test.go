@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -68,8 +69,19 @@ func TestIdentityAuthorization(t *testing.T) {
 				t.Fatalf("login=%q, want %q", request.Header.Get(userLoginHeader), test.expectedLogin)
 			}
 
-			if len(test.handler.TrustedProxyTags) == 0 && (request.Header.Get(appCapabilitiesHeader) != "" || request.Header.Get(userProfilePicHeader) != "") {
+			if len(test.handler.TrustedProxyTags) == 0 && (request.Header.Get(appCapabilitiesHeader) == "spoofed" || request.Header.Get(userProfilePicHeader) != "") {
 				t.Fatal("spoofed identity headers survived direct authentication")
+			}
+
+			if test.allowed && len(test.handler.TrustedProxyTags) == 0 {
+				var capabilities tailcfg.PeerCapMap
+				if err := json.Unmarshal([]byte(request.Header.Get(appCapabilitiesHeader)), &capabilities); err != nil {
+					t.Fatalf("authenticated capabilities are not JSON: %v", err)
+				}
+
+				if !reflect.DeepEqual(capabilities, test.identity.CapMap) {
+					t.Fatal("forwarded capabilities differ from the authenticated policy")
+				}
 			}
 		})
 	}

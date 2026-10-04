@@ -2,6 +2,7 @@ package caddytailscaleservice
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"mime"
 	"net/http"
@@ -143,6 +144,10 @@ func (handler *IdentityHandler) serveIdentity(
 	if handler.RequireUser && (identity.UserProfile == nil || identity.UserProfile.LoginName == "") {
 		return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("request has no Tailscale user identity"))
 	}
+
+	capabilities, _ := json.Marshal(identity.CapMap)
+
+	request.Header.Set(appCapabilitiesHeader, string(capabilities))
 
 	if identity.UserProfile != nil {
 		if identity.UserProfile.LoginName != "" {
