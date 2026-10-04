@@ -73,13 +73,21 @@ func TestIdentityAuthorization(t *testing.T) {
 				t.Fatal("spoofed identity headers survived direct authentication")
 			}
 
+			if !test.allowed && len(test.handler.TrustedProxyTags) == 0 && request.Header.Get(appCapabilitiesHeader) != "" {
+				t.Fatal("capabilities survived denied direct authentication")
+			}
+
 			if test.allowed && len(test.handler.TrustedProxyTags) == 0 {
 				var capabilities tailcfg.PeerCapMap
 				if err := json.Unmarshal([]byte(request.Header.Get(appCapabilitiesHeader)), &capabilities); err != nil {
 					t.Fatalf("authenticated capabilities are not JSON: %v", err)
 				}
 
-				if !reflect.DeepEqual(capabilities, test.identity.CapMap) {
+				if capabilities == nil {
+					t.Fatal("authenticated capabilities must be a JSON object")
+				}
+
+				if test.identity.CapMap != nil && !reflect.DeepEqual(capabilities, test.identity.CapMap) {
 					t.Fatal("forwarded capabilities differ from the authenticated policy")
 				}
 			}

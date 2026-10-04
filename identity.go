@@ -145,9 +145,13 @@ func (handler *IdentityHandler) serveIdentity(
 		return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("request has no Tailscale user identity"))
 	}
 
-	capabilities, _ := json.Marshal(identity.CapMap)
+	capabilities := "{}"
+	if identity.CapMap != nil {
+		encoded, _ := json.Marshal(identity.CapMap)
+		capabilities = string(encoded)
+	}
 
-	request.Header.Set(appCapabilitiesHeader, string(capabilities))
+	request.Header.Set(appCapabilitiesHeader, capabilities)
 
 	if identity.UserProfile != nil {
 		if identity.UserProfile.LoginName != "" {
