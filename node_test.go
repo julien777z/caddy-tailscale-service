@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 )
 
 func TestCreateServiceNodeUsesDedicatedKeyAndNormalizedTags(t *testing.T) {
-	t.Setenv("TS_ADVERTISE_TAGS", "tag:ci tag:gateway")
+	t.Setenv("TS_ADVERTISE_TAGS", "tag:example-staging-internal-proxy tag:example-production-internal-proxy")
 
 	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
 	node, err := createServiceNode("service-node")
@@ -36,7 +37,7 @@ func TestCreateServiceNodeUsesDedicatedKeyAndNormalizedTags(t *testing.T) {
 		t.Fatalf("preauthorized = %q, want true", attributes.Get("preauthorized"))
 	}
 
-	if len(node.AdvertiseTags) != 2 || node.AdvertiseTags[0] != "tag:ci" || node.AdvertiseTags[1] != "tag:gateway" {
+	if len(node.AdvertiseTags) != 2 || node.AdvertiseTags[0] != "tag:example-staging-internal-proxy" || node.AdvertiseTags[1] != "tag:example-production-internal-proxy" {
 		t.Fatalf("AdvertiseTags = %v, want normalized tags", node.AdvertiseTags)
 	}
 	if filepath.Base(node.Dir) != node.Hostname {
@@ -62,7 +63,7 @@ func TestCreateServiceNodeSeparatesStateByHostname(t *testing.T) {
 }
 
 func TestCreateServiceNodeRequiresClientSecret(t *testing.T) {
-	t.Setenv("TS_ADVERTISE_TAGS", "tag:ci")
+	t.Setenv("TS_ADVERTISE_TAGS", "tag:example-staging-internal-proxy")
 
 	t.Setenv("TS_OAUTH_SECRET", "")
 	_, err := createServiceNode("service-node")
@@ -107,11 +108,10 @@ func TestServiceListenerCloseBalancesBothPools(t *testing.T) {
 	gatewayNodePairs.LoadOrStore(
 		gatewayNodePairKey("service-node", "upstream-node"),
 		&gatewayTailscaleNodes{
-			service:       node,
-			startupCancel: func() {},
-			serviceNode:   "service-node",
-			upstream:      &serviceNode{Server: &tsnet.Server{}},
-			upstreamNode:  "upstream-node",
+			service:      node,
+			serviceNode:  "service-node",
+			upstream:     &serviceNode{Server: &tsnet.Server{}},
+			upstreamNode: "upstream-node",
 		},
 	)
 	wrapped := &serviceListener{
@@ -143,182 +143,98 @@ func TestServiceListenerCloseBalancesBothPools(t *testing.T) {
 	}
 }
 
-func TestLoadReadyGatewayTailscaleNodesWaitsForBothNodes(t *testing.T) {
+func TestServiceListenerDefersTailscaleRegistration(t *testing.T) {
+	originalServiceNodes := serviceNodes
+	originalListeners := serviceListeners
+	originalUpstreamNodes := upstreamNodes
+	originalGatewayNodePairs := gatewayNodePairs
+	originalListen := listenTailscaleService
+	serviceNodes = caddy.NewUsagePool()
+	serviceListeners = caddy.NewUsagePool()
+	upstreamNodes = caddy.NewUsagePool()
+	gatewayNodePairs = caddy.NewUsagePool()
+	var attempts atomic.Int32
+	listenTailscaleService = func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error) {
+		attempts.Add(1)
+
+		return nil, errors.New("Tailscale tag is not approved")
+	}
+	t.Cleanup(func() {
+		serviceNodes = originalServiceNodes
+		serviceListeners = originalListeners
+		upstreamNodes = originalUpstreamNodes
+		gatewayNodePairs = originalGatewayNodePairs
+		listenTailscaleService = originalListen
+	})
+	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
+	t.Setenv("TS_ADVERTISE_TAGS", "tag:example-staging-internal-proxy")
+	t.Setenv("TAILSCALE_SERVICE_NAME", "svc:example-staging")
+	t.Setenv("TAILSCALE_SERVICE_NODE_NAME", "example-staging-internal-proxy-host")
+
+	loaded, err := getServiceListener(context.Background(), "", "", "443", 0, net.ListenConfig{})
+	if err != nil {
+		t.Fatalf("getServiceListener returned an error: %v", err)
+	}
+	if attempts.Load() != 0 {
+		t.Fatalf("Tailscale registration started during Caddy startup: %d attempts", attempts.Load())
+	}
+
+	if err := loaded.(*serviceListener).Close(); err != nil {
+		t.Fatalf("close deferred listener: %v", err)
+	}
+}
+
+func TestGatewayTailscaleNodesLoadWithoutTailscaleReadiness(t *testing.T) {
 	originalServiceNodes := serviceNodes
 	originalUpstreamNodes := upstreamNodes
 	originalGatewayNodePairs := gatewayNodePairs
-	originalWaitForTailscaleNode := waitForTailscaleNode
 	serviceNodes = caddy.NewUsagePool()
 	upstreamNodes = caddy.NewUsagePool()
 	gatewayNodePairs = caddy.NewUsagePool()
-	started := make(chan string, 2)
-	deadlines := make(chan time.Time, 2)
-	release := make(chan struct{})
-	waitForTailscaleNode = func(ctx context.Context, nodeName string, _ *serviceNode) error {
-		deadline, hasDeadline := ctx.Deadline()
-		if !hasDeadline {
-			deadlines <- time.Time{}
-		} else {
-			deadlines <- deadline
-		}
-		started <- nodeName
-		<-release
-
-		return nil
-	}
 	t.Cleanup(func() {
 		serviceNodes = originalServiceNodes
 		upstreamNodes = originalUpstreamNodes
 		gatewayNodePairs = originalGatewayNodePairs
-		waitForTailscaleNode = originalWaitForTailscaleNode
 	})
 	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
 
-	loadedNodes := make(chan *gatewayTailscaleNodes, 1)
-	loadedError := make(chan error, 1)
-	go func() {
-		nodes, err := loadReadyGatewayTailscaleNodes(context.Background(), "service-node", "upstream-node")
-		loadedNodes <- nodes
-		loadedError <- err
-	}()
-
-	startedNodeNames := make(map[string]bool, 2)
-	for range 2 {
-		select {
-		case nodeName := <-started:
-			startedNodeNames[nodeName] = true
-		case <-time.After(time.Second):
-			t.Fatal("Tailscale node readiness did not start concurrently")
-		}
-	}
-
-	firstDeadline := <-deadlines
-	secondDeadline := <-deadlines
-	close(release)
-
-	if firstDeadline.IsZero() || secondDeadline.IsZero() {
-		t.Fatal("Tailscale node readiness has no deadline")
-	}
-	if !firstDeadline.Equal(secondDeadline) {
-		t.Fatalf("Tailscale node deadlines differ: %v and %v", firstDeadline, secondDeadline)
-	}
-
-	nodes := <-loadedNodes
-	err := <-loadedError
+	nodes, err := loadGatewayTailscaleNodes("service-node", "upstream-node")
 	if err != nil {
-		t.Fatalf("loadReadyGatewayTailscaleNodes returned an error: %v", err)
+		t.Fatalf("loadGatewayTailscaleNodes returned an error: %v", err)
 	}
-	if nodes.service.Hostname != "service-node" {
-		t.Fatalf("service node hostname = %q", nodes.service.Hostname)
-	}
-	if !startedNodeNames["service-node"] || !startedNodeNames["upstream-node"] {
-		t.Fatalf("started node names = %v", startedNodeNames)
+	if nodes.service.Hostname != "service-node" || nodes.upstream.Hostname != "upstream-node" {
+		t.Fatalf("gateway node names = service %q upstream %q", nodes.service.Hostname, nodes.upstream.Hostname)
 	}
 	if err := releaseGatewayTailscaleNodes("service-node", "upstream-node"); err != nil {
 		t.Fatalf("gateway node pair cleanup returned an error: %v", err)
 	}
 }
 
-func TestReadinessProvisionBlocksHealthPublication(t *testing.T) {
+func TestReadinessProvisionDoesNotRequireTailscaleRegistration(t *testing.T) {
 	originalServiceNodes := serviceNodes
 	originalUpstreamNodes := upstreamNodes
 	originalGatewayNodePairs := gatewayNodePairs
-	originalWaitForTailscaleNode := waitForTailscaleNode
 	serviceNodes = caddy.NewUsagePool()
 	upstreamNodes = caddy.NewUsagePool()
 	gatewayNodePairs = caddy.NewUsagePool()
-	started := make(chan string, 2)
-	release := make(chan struct{})
-	waitForTailscaleNode = func(_ context.Context, nodeName string, _ *serviceNode) error {
-		started <- nodeName
-		<-release
-
-		return nil
-	}
 	t.Cleanup(func() {
 		serviceNodes = originalServiceNodes
 		upstreamNodes = originalUpstreamNodes
 		gatewayNodePairs = originalGatewayNodePairs
-		waitForTailscaleNode = originalWaitForTailscaleNode
 	})
 	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
 	t.Setenv("TAILSCALE_SERVICE_NODE_NAME", "service-node")
 	t.Setenv("TAILSCALE_UPSTREAM_NODE_NAME", "upstream-node")
 
 	readiness := new(Readiness)
-	provisioned := make(chan error, 1)
-	go func() {
-		provisioned <- readiness.Provision(caddy.Context{Context: context.Background()})
-	}()
-
-	for range 2 {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			t.Fatal("readiness provisioning did not wait for both Tailscale nodes")
-		}
-	}
-
-	select {
-	case err := <-provisioned:
-		t.Fatalf("readiness provisioning completed before both nodes were ready: %v", err)
-	default:
-	}
-
-	close(release)
-	if err := <-provisioned; err != nil {
+	if err := readiness.Provision(caddy.Context{Context: context.Background()}); err != nil {
 		t.Fatalf("readiness provisioning returned an error: %v", err)
+	}
+	if readiness.node == nil {
+		t.Fatal("readiness provisioning did not retain the service node")
 	}
 	if err := readiness.Cleanup(); err != nil {
 		t.Fatalf("readiness cleanup returned an error: %v", err)
-	}
-	if _, exists := serviceNodes.References("service-node"); exists {
-		t.Fatal("service node reference remains after readiness cleanup")
-	}
-	if _, exists := upstreamNodes.References("upstream-node"); exists {
-		t.Fatal("upstream node reference remains after readiness cleanup")
-	}
-}
-
-func TestLoadReadyGatewayServiceNodeCleansUpWhenUpstreamReadinessFails(t *testing.T) {
-	for name, readinessError := range map[string]error{
-		"timeout":     context.DeadlineExceeded,
-		"unavailable": errors.New("unavailable"),
-	} {
-		t.Run(name, func(t *testing.T) {
-			originalServiceNodes := serviceNodes
-			originalUpstreamNodes := upstreamNodes
-			originalGatewayNodePairs := gatewayNodePairs
-			originalWaitForTailscaleNode := waitForTailscaleNode
-			serviceNodes = caddy.NewUsagePool()
-			upstreamNodes = caddy.NewUsagePool()
-			gatewayNodePairs = caddy.NewUsagePool()
-			waitForTailscaleNode = func(_ context.Context, nodeName string, _ *serviceNode) error {
-				if nodeName == "upstream-node" {
-					return readinessError
-				}
-
-				return nil
-			}
-			t.Cleanup(func() {
-				serviceNodes = originalServiceNodes
-				upstreamNodes = originalUpstreamNodes
-				gatewayNodePairs = originalGatewayNodePairs
-				waitForTailscaleNode = originalWaitForTailscaleNode
-			})
-			t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
-
-			_, err := loadReadyGatewayTailscaleNodes(context.Background(), "service-node", "upstream-node")
-			if err == nil {
-				t.Fatal("loadReadyGatewayTailscaleNodes accepted an unready upstream node")
-			}
-			if _, exists := serviceNodes.References("service-node"); exists {
-				t.Fatal("service node reference remains after upstream readiness failure")
-			}
-			if _, exists := upstreamNodes.References("upstream-node"); exists {
-				t.Fatal("upstream node reference remains after readiness failure")
-			}
-		})
 	}
 }
 
@@ -346,13 +262,10 @@ func TestProxyProtocolPorts(t *testing.T) {
 	}
 }
 
-func TestSingleNodeReadiness(t *testing.T) {
-	originalWait := waitForTailscaleNode
-	waitForTailscaleNode = func(context.Context, string, *serviceNode) error { return nil }
-	t.Cleanup(func() { waitForTailscaleNode = originalWait })
+func TestSingleGatewayNodeLoadsWithoutUp(t *testing.T) {
 	t.Setenv("TS_OAUTH_SECRET", "tskey-client-example")
 
-	nodes, err := loadReadyGatewayTailscaleNodes(context.Background(), "single-example", "")
+	nodes, err := loadGatewayTailscaleNodes("single-example", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,9 +282,6 @@ func TestSingleNodeReadiness(t *testing.T) {
 
 func TestListenerOverlap(t *testing.T) {
 	t.Setenv("TS_OAUTH_SECRET", "tskey-client-example")
-	originalWait := waitForTailscaleNode
-	waitForTailscaleNode = func(context.Context, string, *serviceNode) error { return nil }
-	t.Cleanup(func() { waitForTailscaleNode = originalWait })
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -382,7 +292,7 @@ func TestListenerOverlap(t *testing.T) {
 	wrappers := make([]*serviceListener, 2)
 	for index := range wrappers {
 		serviceListeners.LoadOrStore(shared.key, shared)
-		if _, err := loadReadyGatewayTailscaleNodes(context.Background(), t.Name(), ""); err != nil {
+		if _, err := loadGatewayTailscaleNodes(t.Name(), ""); err != nil {
 			t.Fatal(err)
 		}
 		wrappers[index] = &serviceListener{sharedServiceListener: shared, serviceNodeName: t.Name(), closedCh: make(chan struct{})}
@@ -437,6 +347,78 @@ func TestListenerOverlap(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("surviving wrapper did not receive connection")
+	}
+}
+
+func TestRetryingServiceListenerRecoversFromRegistrationFailure(t *testing.T) {
+	originalListen := listenTailscaleService
+	originalInterval := servicePublicationInterval
+	servicePublicationInterval = time.Millisecond
+	t.Cleanup(func() {
+		listenTailscaleService = originalListen
+		servicePublicationInterval = originalInterval
+	})
+
+	service, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+
+	var attempts atomic.Int32
+	listenTailscaleService = func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error) {
+		if attempts.Add(1) == 1 {
+			return nil, errors.New("Tailscale tag is not approved")
+		}
+
+		return service, nil
+	}
+
+	published := make(chan struct{}, 1)
+	listener := newRetryingServiceListener(
+		&serviceNode{Server: &tsnet.Server{}},
+		"svc:example-staging",
+		tsnet.ServiceModeTCP{Port: 443},
+		func() { published <- struct{}{} },
+	)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if connection != nil {
+			_ = connection.Close()
+		}
+		accepted <- acceptErr
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for attempts.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if attempts.Load() < 2 {
+		t.Fatal("listener did not retry after registration failed")
+	}
+
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("listener did not publish service addresses after recovery")
+	}
+
+	connection, err := net.DialTimeout("tcp", service.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial service listener: %v", err)
+	}
+	defer connection.Close()
+
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("listener did not recover: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener did not accept after registration recovered")
 	}
 }
 
