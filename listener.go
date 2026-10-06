@@ -449,11 +449,13 @@ func newRetryingServiceListener(
 	publish func(),
 ) *retryingServiceListener {
 	return &retryingServiceListener{
-		serviceMode:   serviceMode,
-		serviceName:   serviceName,
-		node:          node,
-		publish:       publish,
-		listen:        (*serviceNode).ListenService,
+		serviceMode: serviceMode,
+		serviceName: serviceName,
+		node:        node,
+		publish:     publish,
+		listen: func(node *serviceNode, name string, mode tsnet.ServiceModeTCP) (net.Listener, error) {
+			return node.ListenService(name, mode)
+		},
 		retryInterval: servicePublicationInterval,
 		closed:        make(chan struct{}),
 	}
