@@ -18,9 +18,9 @@ def main() -> None:
             "replacement began before service retirement completed",
         ),
         (
-            "obsolete adoption", "^TestRegistrationReplacement$",
-            "if listener.registration != registration {", "if false && listener.registration != registration {",
-            "obsolete registration",
+            "registration publication", "^TestPendingRegistrationWaiters/closed=false",
+            "listener.listener = created", "listener.listener = nil",
+            "registration kept a service waiter blocked",
         ),
     )
 

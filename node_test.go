@@ -476,53 +476,75 @@ func TestServiceNodeReplacesCachedStartupFailure(t *testing.T) {
 	}
 }
 
-func TestPendingRegistrationClosure(t *testing.T) {
-	for _, waiters := range []int{1, 8} {
-		t.Run(fmt.Sprintf("waiters=%d", waiters), func(t *testing.T) {
-			registration := newBlockedServiceRegistration(t)
-			results := make(chan error, waiters)
-			for range waiters {
-				go func() {
-					connection, err := registration.listener.Accept()
-					if connection != nil {
+func TestPendingRegistrationWaiters(t *testing.T) {
+	for _, closed := range []bool{true, false} {
+		for _, waiters := range []int{1, 8} {
+			t.Run(fmt.Sprintf("closed=%t/waiters=%d", closed, waiters), func(t *testing.T) {
+				registration := newBlockedServiceRegistration(t)
+				results := make(chan error, waiters)
+				for range waiters {
+					go func() {
+						connection, err := registration.listener.Accept()
+						if connection != nil {
+							_ = connection.Close()
+						}
+						results <- err
+					}()
+				}
+
+				select {
+				case <-registration.started:
+				case <-time.After(time.Second):
+					t.Fatal("service registration did not start")
+				}
+				time.Sleep(50 * time.Millisecond)
+
+				if got := registration.attempts.Load(); got != 1 {
+					t.Fatalf("pending registration attempts=%d, want one", got)
+				}
+				if closed {
+					if err := registration.listener.Close(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					registration.releaseOnce.Do(func() { close(registration.release) })
+					for range waiters {
+						connection, err := net.DialTimeout("tcp", registration.created.Addr().String(), time.Second)
+						if err != nil {
+							t.Fatalf("registered listener did not accept connections: %v", err)
+						}
 						_ = connection.Close()
 					}
-					results <- err
-				}()
-			}
-
-			select {
-			case <-registration.started:
-			case <-time.After(time.Second):
-				t.Fatal("service registration did not start")
-			}
-			time.Sleep(50 * time.Millisecond)
-
-			if got := registration.attempts.Load(); got != 1 {
-				t.Fatalf("pending registration attempts=%d, want one", got)
-			}
-			if err := registration.listener.Close(); err != nil {
-				t.Fatal(err)
-			}
-
-			for range waiters {
-				select {
-				case err := <-results:
-					if !errors.Is(err, net.ErrClosed) {
-						t.Fatalf("closed registration returned %v", err)
-					}
-				case <-time.After(time.Second):
-					t.Fatal("closure kept a service waiter blocked")
 				}
-			}
 
-			registration.releaseOnce.Do(func() { close(registration.release) })
-			select {
-			case <-registration.created.closed:
-			case <-time.After(time.Second):
-				t.Fatal("late service listener was not closed")
-			}
-		})
+				for range waiters {
+					select {
+					case err := <-results:
+						if closed && !errors.Is(err, net.ErrClosed) {
+							t.Fatalf("closed registration returned %v", err)
+						}
+						if !closed && err != nil {
+							t.Fatalf("completed registration returned %v", err)
+						}
+					case <-time.After(time.Second):
+						t.Fatalf("closed=%t registration kept a service waiter blocked", closed)
+					}
+				}
+
+				if closed {
+					registration.releaseOnce.Do(func() { close(registration.release) })
+					select {
+					case <-registration.created.closed:
+					case <-time.After(time.Second):
+						t.Fatal("late service handle was not closed")
+					}
+				}
+				if got := registration.attempts.Load(); got != 1 {
+					t.Fatalf("registration attempts=%d, want one", got)
+				}
+
+			})
+		}
 	}
 }
 
