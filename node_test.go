@@ -525,3 +525,142 @@ func TestPendingRegistrationClosure(t *testing.T) {
 		})
 	}
 }
+
+func TestAcceptFaultRecovery(t *testing.T) {
+	for _, temporary := range []bool{true, false} {
+		t.Run(fmt.Sprintf("temporary=%t", temporary), func(t *testing.T) {
+			scenario := newAcceptRecoveryScenario(t, temporary)
+			accepted := make(chan error, 1)
+			go func() {
+				connection, err := scenario.listener.Accept()
+				if connection != nil {
+					_ = connection.Close()
+				}
+				accepted <- err
+			}()
+
+			select {
+			case <-scenario.first.failed:
+			case <-time.After(time.Second):
+				t.Fatal("accept fault was not exercised")
+			}
+
+			address := scenario.first.Addr()
+			if !temporary {
+				deadline := time.Now().Add(time.Second)
+				for scenario.attempts.Load() < 2 && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+				}
+
+				if scenario.retirementViolation.Load() {
+					t.Fatal("replacement began before service retirement completed")
+				}
+
+				select {
+				case <-scenario.replaced:
+				case <-time.After(time.Second):
+					t.Fatal("failed service registration was not replaced")
+				}
+				address = scenario.replacement.Addr()
+			}
+
+			client, err := net.DialTimeout("tcp", address.String(), time.Second)
+			if err != nil {
+				t.Fatalf("recovered listener did not accept a connection: %v", err)
+			}
+			defer client.Close()
+
+			select {
+			case err := <-accepted:
+				if err != nil {
+					t.Fatalf("recovered accept returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("recovered listener kept the connection blocked")
+			}
+
+			if temporary {
+				if scenario.attempts.Load() != 1 {
+					t.Fatal("temporary accept failure replaced the active service")
+				}
+
+				select {
+				case <-scenario.first.closed:
+					t.Fatal("temporary accept failure closed the active service")
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestRegistrationReplacement(t *testing.T) {
+	scenario := newRegistrationReplacementScenario(t)
+	leading := make(chan activeListenerResult, 1)
+	lagging := make(chan activeListenerResult, 1)
+	go runRegistrationReader("leading", func() {
+		active, err := scenario.listener.activeListener()
+		if err != nil {
+			leading <- activeListenerResult{err: err}
+			return
+		}
+
+		if err = scenario.listener.clear(active); err != nil {
+			leading <- activeListenerResult{err: err}
+			return
+		}
+
+		active, err = scenario.listener.activeListener()
+		leading <- activeListenerResult{listener: active, err: err}
+	})
+	select {
+	case <-scenario.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial registration did not start")
+	}
+	waitForReaderPhase(t, "leading", false, nil)
+
+	go runRegistrationReader("lagging", func() {
+		active, err := scenario.listener.activeListener()
+		lagging <- activeListenerResult{listener: active, err: err}
+	})
+	waitForReaderPhase(t, "lagging", false, nil)
+
+	scenario.releaseFirstOnce.Do(func() { close(scenario.releaseFirst) })
+	select {
+	case <-scenario.first.started:
+	case <-time.After(time.Second):
+		t.Fatal("initial registration was not retired")
+	}
+	waitForReaderPhase(t, "lagging", true, nil)
+	scenario.first.releaseClose()
+	select {
+	case <-scenario.replacementStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement registration did not start")
+	}
+
+	waitForReaderPhase(t, "lagging", false, lagging)
+	scenario.releaseReplacementOnce.Do(func() { close(scenario.releaseReplacement) })
+	for name, results := range map[string]chan activeListenerResult{"leading": leading, "lagging": lagging} {
+		select {
+		case result := <-results:
+			if result.err != nil || result.listener != scenario.replacement {
+				t.Fatalf("%s reader adopted obsolete registration: listener=%T error=%v", name, result.listener, result.err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s reader did not acquire replacement", name)
+		}
+	}
+
+	connection, err := net.DialTimeout("tcp", scenario.replacement.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	accepted, err := scenario.listener.Accept()
+	if err != nil {
+		t.Fatalf("replacement not usable: %v", err)
+	}
+	_ = accepted.Close()
+}

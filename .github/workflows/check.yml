@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      prove_accept_recovery:
+        description: Verify accept recovery and registration replacement mutations
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,6 +29,9 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test Module
         run: go test -race ./...
+      - name: Prove Accept Recovery
+        if: ${{ inputs.prove_accept_recovery }}
+        run: python3 .github/scripts/verify_accept_recovery.py
       - name: Vet Module
         run: go vet ./...
       - name: Build Caddy
