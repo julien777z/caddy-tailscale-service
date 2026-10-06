@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -456,5 +457,49 @@ func TestListenerStartupDeadline(t *testing.T) {
 	_, err = listener.Accept()
 	if !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("late listener remained open: %v", err)
+	}
+}
+
+func TestServiceNodeReplacesCachedStartupFailure(t *testing.T) {
+	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
+	t.Setenv("TS_ADVERTISE_TAGS", "tag:example-staging")
+
+	blockedState := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedState, []byte("occupied"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	failedServer := &tsnet.Server{Hostname: t.Name(), Dir: blockedState}
+	initialError := failedServer.Start()
+	if initialError == nil {
+		t.Fatal("SDK accepted a state path that is a file")
+	}
+
+	failedServer.Dir = t.TempDir()
+	if retryError := failedServer.Start(); retryError != initialError {
+		t.Fatalf("SDK did not retain its initialization error: %v", retryError)
+	}
+
+	node := &serviceNode{Server: failedServer}
+	t.Cleanup(func() { _ = node.Close() })
+	if _, err := node.LocalClient(); err == nil {
+		t.Fatal("failed initialization was not reported")
+	}
+
+	if node.Server == failedServer {
+		t.Fatal("retry retained the SDK instance with a cached initialization failure")
+	}
+	if node.Hostname != t.Name() || !node.Ephemeral {
+		t.Fatal("replacement lost the ephemeral host identity")
+	}
+	if node.ClientSecret == "" || len(node.AdvertiseTags) != 1 {
+		t.Fatal("replacement lost provisioning configuration")
+	}
+
+	if err := node.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := node.LocalClient(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed lifecycle retried initialization: %v", err)
 	}
 }
