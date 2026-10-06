@@ -483,11 +483,26 @@ func (listener *retryingServiceListener) Accept() (net.Conn, error) {
 			return nil, net.ErrClosed
 		}
 
-		listener.clear(active)
+		var networkError net.Error
+		if errors.As(acceptErr, &networkError) && networkError.Temporary() {
+			caddy.Log().Warn(
+				"Tailscale service accept temporarily unavailable; retrying",
+				zap.String("service", listener.serviceName),
+				zap.Error(acceptErr),
+			)
+
+			if !listener.waitForRetry() {
+				return nil, net.ErrClosed
+			}
+
+			continue
+		}
+
+		cleanupErr := listener.clear(active)
 		caddy.Log().Warn(
 			"Tailscale service listener stopped; retrying",
 			zap.String("service", listener.serviceName),
-			zap.Error(acceptErr),
+			zap.Error(errors.Join(acceptErr, cleanupErr)),
 		)
 	}
 }
@@ -499,67 +514,73 @@ type serviceRegistration struct {
 }
 
 func (listener *retryingServiceListener) activeListener() (net.Listener, error) {
-	listener.mu.Lock()
-	if listener.isClosed() {
+	for {
+		listener.mu.Lock()
+		if listener.isClosed() {
+			listener.mu.Unlock()
+
+			return nil, net.ErrClosed
+		}
+
+		if listener.listener != nil {
+			active := listener.listener
+			listener.mu.Unlock()
+
+			return active, nil
+		}
+
+		registration := listener.registration
+		if registration == nil {
+			registration = &serviceRegistration{done: make(chan struct{})}
+			listener.registration = registration
+			go listener.register(registration)
+		}
 		listener.mu.Unlock()
 
-		return nil, net.ErrClosed
-	}
+		select {
+		case <-listener.closed:
+			return nil, net.ErrClosed
+		case <-registration.done:
+		}
 
-	if listener.listener != nil {
-		active := listener.listener
-		listener.mu.Unlock()
+		listener.mu.Lock()
+		if listener.isClosed() {
+			listener.mu.Unlock()
 
-		return active, nil
-	}
+			return nil, net.ErrClosed
+		}
 
-	registration := listener.registration
-	if registration == nil {
-		registration = &serviceRegistration{done: make(chan struct{})}
-		listener.registration = registration
-		go listener.register(registration)
-	}
-	listener.mu.Unlock()
+		if listener.listener != nil {
+			active := listener.listener
+			listener.mu.Unlock()
 
-	select {
-	case <-listener.closed:
-		return nil, net.ErrClosed
-	case <-registration.done:
-	}
+			return active, nil
+		}
 
-	listener.mu.Lock()
-	if listener.isClosed() {
-		listener.mu.Unlock()
+		if listener.registration != registration {
+			listener.mu.Unlock()
 
-		return nil, net.ErrClosed
-	}
+			continue
+		}
 
-	if listener.listener != nil {
-		active := listener.listener
-		listener.mu.Unlock()
-
-		return active, nil
-	}
-
-	if listener.registration == registration {
 		listener.registration = nil
-	}
 
-	if registration.err != nil {
+		if registration.err != nil {
+			listener.mu.Unlock()
+
+			return nil, registration.err
+		}
+
+		listener.listener = registration.listener
+		publish := listener.publish
 		listener.mu.Unlock()
 
-		return nil, registration.err
+		if publish != nil {
+			publish()
+		}
+
+		return registration.listener, nil
 	}
-
-	listener.listener = registration.listener
-	publish := listener.publish
-	listener.mu.Unlock()
-
-	if publish != nil {
-		publish()
-	}
-
-	return registration.listener, nil
 }
 
 func (listener *retryingServiceListener) register(registration *serviceRegistration) {
@@ -593,13 +614,18 @@ func (listener *retryingServiceListener) waitForRetry() bool {
 	}
 }
 
-func (listener *retryingServiceListener) clear(active net.Listener) {
+func (listener *retryingServiceListener) clear(active net.Listener) error {
 	listener.mu.Lock()
 	defer listener.mu.Unlock()
 
 	if listener.listener == active {
+		closeErr := active.Close()
 		listener.listener = nil
+
+		return closeErr
 	}
+
+	return nil
 }
 
 func (listener *retryingServiceListener) Close() error {
