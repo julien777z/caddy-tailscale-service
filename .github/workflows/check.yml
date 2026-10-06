@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      prove_publication:
+        type: boolean
+        default: false
+        description: Prove shutdown publication regression and restore source
 
 permissions:
   contents: read
@@ -24,6 +29,9 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test Module
         run: go test -race ./...
+      - name: Prove Publication Regression
+        if: ${{ inputs.prove_publication }}
+        run: python3 .github/prove-publication.py
       - name: Vet Module
         run: go vet ./...
       - name: Build Caddy
