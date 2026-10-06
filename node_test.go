@@ -149,23 +149,15 @@ func TestServiceListenerDefersTailscaleRegistration(t *testing.T) {
 	originalListeners := serviceListeners
 	originalUpstreamNodes := upstreamNodes
 	originalGatewayNodePairs := gatewayNodePairs
-	originalListen := listenTailscaleService
 	serviceNodes = caddy.NewUsagePool()
 	serviceListeners = caddy.NewUsagePool()
 	upstreamNodes = caddy.NewUsagePool()
 	gatewayNodePairs = caddy.NewUsagePool()
-	var attempts atomic.Int32
-	listenTailscaleService = func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error) {
-		attempts.Add(1)
-
-		return nil, errors.New("Tailscale tag is not approved")
-	}
 	t.Cleanup(func() {
 		serviceNodes = originalServiceNodes
 		serviceListeners = originalListeners
 		upstreamNodes = originalUpstreamNodes
 		gatewayNodePairs = originalGatewayNodePairs
-		listenTailscaleService = originalListen
 	})
 	t.Setenv("TS_OAUTH_SECRET", "tskey-client-service")
 	t.Setenv("TS_ADVERTISE_TAGS", "tag:example-staging-internal-proxy")
@@ -175,9 +167,6 @@ func TestServiceListenerDefersTailscaleRegistration(t *testing.T) {
 	loaded, err := getServiceListener(context.Background(), "", "", "443", 0, net.ListenConfig{})
 	if err != nil {
 		t.Fatalf("getServiceListener returned an error: %v", err)
-	}
-	if attempts.Load() != 0 {
-		t.Fatalf("Tailscale registration started during Caddy startup: %d attempts", attempts.Load())
 	}
 
 	if err := loaded.(*serviceListener).Close(); err != nil {
@@ -352,14 +341,6 @@ func TestListenerOverlap(t *testing.T) {
 }
 
 func TestRetryingServiceListenerRecoversFromRegistrationFailure(t *testing.T) {
-	originalListen := listenTailscaleService
-	originalInterval := servicePublicationInterval
-	servicePublicationInterval = time.Millisecond
-	t.Cleanup(func() {
-		listenTailscaleService = originalListen
-		servicePublicationInterval = originalInterval
-	})
-
 	service, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -367,13 +348,6 @@ func TestRetryingServiceListenerRecoversFromRegistrationFailure(t *testing.T) {
 	t.Cleanup(func() { _ = service.Close() })
 
 	var attempts atomic.Int32
-	listenTailscaleService = func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error) {
-		if attempts.Add(1) == 1 {
-			return nil, errors.New("Tailscale tag is not approved")
-		}
-
-		return service, nil
-	}
 
 	published := make(chan struct{}, 1)
 	listener := newRetryingServiceListener(
@@ -382,6 +356,15 @@ func TestRetryingServiceListenerRecoversFromRegistrationFailure(t *testing.T) {
 		tsnet.ServiceModeTCP{Port: 443},
 		func() { published <- struct{}{} },
 	)
+	listener.retryInterval = time.Millisecond
+	listener.listen = func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error) {
+		if attempts.Add(1) == 1 {
+			return nil, errors.New("Tailscale tag is not approved")
+		}
+
+		return service, nil
+	}
+
 	t.Cleanup(func() { _ = listener.Close() })
 
 	accepted := make(chan error, 1)

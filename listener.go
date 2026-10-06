@@ -36,7 +36,7 @@ var gatewayNodePairs = caddy.NewUsagePool()
 
 const servicePublicationTimeout = time.Minute
 
-var servicePublicationInterval = time.Second
+const servicePublicationInterval = time.Second
 
 func init() {
 	caddy.RegisterNetwork("tailscale-service", getServiceListener)
@@ -428,20 +428,13 @@ type acceptedConnection struct {
 	err        error
 }
 
-var listenTailscaleService = func(
-	node *serviceNode,
-	serviceName string,
-	serviceMode tsnet.ServiceModeTCP,
-) (net.Listener, error) {
-	return node.ListenService(serviceName, serviceMode)
-}
-
 type retryingServiceListener struct {
-	serviceMode tsnet.ServiceModeTCP
-	serviceName string
-	node        *serviceNode
-	publish     func()
-	listen      func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error)
+	serviceMode   tsnet.ServiceModeTCP
+	serviceName   string
+	node          *serviceNode
+	publish       func()
+	listen        func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error)
+	retryInterval time.Duration
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -456,12 +449,13 @@ func newRetryingServiceListener(
 	publish func(),
 ) *retryingServiceListener {
 	return &retryingServiceListener{
-		serviceMode: serviceMode,
-		serviceName: serviceName,
-		node:        node,
-		publish:     publish,
-		listen:      listenTailscaleService,
-		closed:      make(chan struct{}),
+		serviceMode:   serviceMode,
+		serviceName:   serviceName,
+		node:          node,
+		publish:       publish,
+		listen:        (*serviceNode).ListenService,
+		retryInterval: servicePublicationInterval,
+		closed:        make(chan struct{}),
 	}
 }
 
@@ -549,7 +543,7 @@ func (listener *retryingServiceListener) activeListener() (net.Listener, error) 
 }
 
 func (listener *retryingServiceListener) waitForRetry() bool {
-	timer := time.NewTimer(servicePublicationInterval)
+	timer := time.NewTimer(listener.retryInterval)
 	defer timer.Stop()
 
 	select {
@@ -827,8 +821,12 @@ func (node *serviceNode) publishServiceAddresses(
 		return
 	}
 
-	// Node provisioning has completed Up, which initializes and retains this client.
-	client, _ := node.LocalClient()
+	client, err := node.LocalClient()
+	if err != nil {
+		caddy.Log().Error("start Tailscale service address publication", zap.Error(err))
+
+		return
+	}
 
 	publisherContext, cancel := context.WithCancel(context.Background())
 	node.publisherCancel = cancel
