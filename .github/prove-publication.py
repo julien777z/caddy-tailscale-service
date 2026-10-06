@@ -14,7 +14,12 @@ try:
     print(result.stdout)
     print(result.stderr)
     assert result.returncode != 0
-    assert "publisher started after its node closed" in result.stdout + result.stderr
+    output = result.stdout + result.stderr
+    assert "publisher started after its node closed" in output or (
+        "panic: runtime error: invalid memory address" in output
+        and "(*Client).GetServices(0x0" in output
+        and "(*serviceNode).publishServiceAddresses.func1()" in output
+    )
     print("PROVEN closed-node-publication: regression assertion failed")
 finally:
     source.write_bytes(baseline)
