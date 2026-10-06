@@ -87,7 +87,7 @@ func (transport *Transport) UnmarshalCaddyfile(dispenser *caddyfile.Dispenser) e
 	return nil
 }
 
-func (transport *Transport) Provision(ctx caddy.Context) error {
+func (transport *Transport) Provision(_ caddy.Context) error {
 	if transport.ServiceName == "" {
 		serviceNodeName, upstreamNodeName, err := gatewayTailscaleNodeNames()
 		if err != nil {
@@ -97,7 +97,7 @@ func (transport *Transport) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("TAILSCALE_UPSTREAM_NODE_NAME is required for hostname transport")
 		}
 
-		nodes, err := loadReadyGatewayTailscaleNodes(ctx, serviceNodeName, upstreamNodeName)
+		nodes, err := loadGatewayTailscaleNodes(serviceNodeName, upstreamNodeName)
 		if err != nil {
 			return err
 		}

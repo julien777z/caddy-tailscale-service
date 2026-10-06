@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"tailscale.com/tailcfg"
 	"testing"
+
+	"tailscale.com/tsnet"
 )
 
 func TestIPv4ServiceAddressesSelectsIPv4Addresses(t *testing.T) {
@@ -79,5 +81,22 @@ func TestPublicationRequiresPrimaryRoute(t *testing.T) {
 				t.Fatalf("published addresses=%v", addresses)
 			}
 		})
+	}
+}
+
+func TestPublicationAfterClosure(t *testing.T) {
+	node := &serviceNode{Server: &tsnet.Server{Dir: t.TempDir()}}
+	if err := node.Close(); err != nil {
+		t.Fatalf("close node: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "services.json")
+	node.publishServiceAddresses(path, string(publicationServiceName))
+	if node.publisherCancel != nil {
+		t.Fatal("publisher started after its node closed")
+	}
+
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("closed node published service addresses: %v", err)
 	}
 }

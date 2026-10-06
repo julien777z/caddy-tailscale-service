@@ -6,7 +6,7 @@ Expose Caddy through Tailscale Services and reach upstreams over the tailnet.
 
 - TCP service listeners with optional PROXY protocol v2.
 - TLS and plaintext reverse-proxy transports, with service discovery and timeout recovery.
-- Single-node or paired service/upstream startup under one readiness deadline.
+- Lazy service/upstream startup with listener recovery in the running process.
 - Direct user identity, capability checks, and trusted proxy identity forwarding.
 - Atomic IPv4 service-address publication after primary-route activation.
 
@@ -16,7 +16,7 @@ Build Caddy with a released module version:
 
 ```sh
 xcaddy build v2.11.4 \
-  --with github.com/julien777z/caddy-tailscale-service@v0.1.0
+  --with github.com/julien777z/caddy-tailscale-service@v0.1.1
 ```
 
 Publish a listener using the configured service name and node:
@@ -65,7 +65,7 @@ tailscale_identity {
 }
 ```
 
-Use `tailscale_readiness` on a health endpoint to wait for the configured nodes during provisioning
+Use `tailscale_readiness` on a health endpoint to start the service node when requested
 and return HTTP 503 until the service has an active primary route.
 
 ## Configuration
@@ -76,13 +76,15 @@ and return HTTP 503 until the service has an active primary route.
 | `TS_ADVERTISE_TAGS` | Space-separated node tags. |
 | `TAILSCALE_SERVICE_NAME` | Service name, such as `svc:example`. |
 | `TAILSCALE_SERVICE_NODE_NAME` | Service node hostname. |
-| `TAILSCALE_UPSTREAM_NODE_NAME` | Optional distinct upstream hostname; setting it enables paired readiness. Required for hostname transport. |
+| `TAILSCALE_UPSTREAM_NODE_NAME` | Optional distinct upstream hostname. Required for hostname transport. |
 | `TAILSCALE_PROXY_PROTOCOL_PORTS` | Space-separated listener ports emitting PROXY protocol v2; empty disables it. Configure matching Caddy `proxy_protocol` wrappers. |
 | `TAILSCALE_SERVICES_FILE` | Optional path for published IPv4 service addresses, refreshed every minute. |
 | `TAILSCALE_IDENTITY_STRIP_HEADERS` | Additional space-separated headers stripped by identity handlers. |
 
-Paired nodes start concurrently within one 60-second deadline. Service listeners register without
-waiting for route activation, allowing every configured port to be advertised. The health endpoint
+Provisioning allocates nodes without waiting for Tailscale. Service listeners, outbound requests,
+and readiness requests start the nodes when used. Service listeners retry failed registration in
+the running Caddy process without waiting for route activation, allowing every configured port
+to be advertised. The health endpoint
 requires an active primary route independently of optional file publication. Optional publication
 waits up to 60 seconds for that route and refreshes the file every minute. Explicit-service transports use a dedicated
 outbound node named after the

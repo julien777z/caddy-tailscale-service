@@ -11,9 +11,9 @@ import (
 func TestReadinessRequiresPrimaryRoute(t *testing.T) {
 	for _, routed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "unrouted", true: "routed"}[routed], func(t *testing.T) {
-			client := publicationClient(t, routed)
+			node := publicationNode(t, routed)
 			readiness := Readiness{
-				client:      client,
+				node:        node,
 				serviceName: string(publicationServiceName),
 			}
 			called := false

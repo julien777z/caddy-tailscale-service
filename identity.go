@@ -53,7 +53,7 @@ func (IdentityHandler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (handler *IdentityHandler) Provision(ctx caddy.Context) error {
+func (handler *IdentityHandler) Provision(_ caddy.Context) error {
 	if handler.Capability != "" && len(handler.TrustedProxyTags) != 0 {
 		return fmt.Errorf("Tailscale capabilities apply to direct identities, not forwarded identities")
 	}
@@ -68,7 +68,7 @@ func (handler *IdentityHandler) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("TAILSCALE_SERVICE_NAME is required")
 	}
 
-	nodes, err := loadReadyGatewayTailscaleNodes(ctx, serviceNodeName, upstreamNodeName)
+	nodes, err := loadGatewayTailscaleNodes(serviceNodeName, upstreamNodeName)
 	if err != nil {
 		return err
 	}
@@ -94,7 +94,7 @@ func (handler *IdentityHandler) Cleanup() error {
 func (handler *IdentityHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request, next caddyhttp.Handler) error {
 	client, err := handler.node.LocalClient()
 	if err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError, err)
+		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("Tailscale service identity is unavailable"))
 	}
 
 	return handler.serveIdentity(writer, request, next, client.WhoIsForService)

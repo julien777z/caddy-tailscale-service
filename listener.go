@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 	"tailscale.com/client/local"
 	_ "tailscale.com/feature/oauthkey"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
@@ -34,6 +35,7 @@ var upstreamNodes = caddy.NewUsagePool()
 var gatewayNodePairs = caddy.NewUsagePool()
 
 const servicePublicationTimeout = time.Minute
+
 const servicePublicationInterval = time.Second
 
 func init() {
@@ -44,7 +46,7 @@ func init() {
 }
 
 func getServiceListener(
-	ctx context.Context,
+	_ context.Context,
 	_ string,
 	_ string,
 	portRange string,
@@ -76,16 +78,9 @@ func getServiceListener(
 		return nil, fmt.Errorf("TAILSCALE_SERVICE_NAME is required")
 	}
 
-	nodes, err := loadReadyGatewayTailscaleNodes(ctx, serviceNodeName, upstreamNodeName)
+	nodes, err := loadGatewayTailscaleNodes(serviceNodeName, upstreamNodeName)
 	if err != nil {
 		return nil, err
-	}
-	serviceNode := nodes.service
-	startupContext := nodes.startupContext
-	if nodes.active.Load() {
-		var cancel context.CancelFunc
-		startupContext, cancel = context.WithTimeout(ctx, servicePublicationTimeout)
-		defer cancel()
 	}
 
 	listenerKey := fmt.Sprintf("%s:%s:%d:%d", serviceNodeName, serviceName, effectivePort, proxyVersion)
@@ -94,12 +89,17 @@ func getServiceListener(
 			Port:                 uint16(effectivePort),
 			PROXYProtocolVersion: proxyVersion,
 		}
-		serviceListener, listenError := listenBeforeDeadline(startupContext, func() (net.Listener, error) {
-			return serviceNode.ListenService(serviceName, serviceMode)
-		})
-		if listenError != nil {
-			return nil, listenError
-		}
+		servicesPath := os.Getenv("TAILSCALE_SERVICES_FILE")
+		serviceListener := newRetryingServiceListener(
+			nodes.service,
+			serviceName,
+			serviceMode,
+			func() {
+				if servicesPath != "" {
+					nodes.service.publishServiceAddresses(servicesPath, serviceName)
+				}
+			},
+		)
 
 		return &sharedServiceListener{Listener: serviceListener, key: listenerKey}, nil
 	})
@@ -108,12 +108,6 @@ func getServiceListener(
 
 		return nil, errors.Join(err, cleanupErr)
 	}
-
-	if path := os.Getenv("TAILSCALE_SERVICES_FILE"); path != "" {
-		serviceNode.publishServiceAddresses(path, serviceName)
-	}
-
-	nodes.active.Store(true)
 
 	return &serviceListener{
 		sharedServiceListener: listener.(*sharedServiceListener),
@@ -124,40 +118,39 @@ func getServiceListener(
 }
 
 type gatewayTailscaleNodes struct {
-	service        *serviceNode
-	startupCancel  context.CancelFunc
-	startupContext context.Context
-	active         atomic.Bool
-	serviceNode    string
-	upstream       *serviceNode
-	upstreamNode   string
+	service      *serviceNode
+	serviceNode  string
+	upstream     *serviceNode
+	upstreamNode string
 }
 
-func loadReadyGatewayTailscaleNodes(
-	ctx context.Context,
+func loadGatewayTailscaleNodes(
 	serviceNodeName string,
 	upstreamNodeName string,
 ) (*gatewayTailscaleNodes, error) {
 	pairKey := gatewayNodePairKey(serviceNodeName, upstreamNodeName)
 	nodePair, _, err := gatewayNodePairs.LoadOrNew(pairKey, func() (caddy.Destructor, error) {
-		startupContext, cancel := context.WithTimeout(ctx, servicePublicationTimeout)
-		nodes, loadErr := createReadyGatewayTailscaleNodes(
-			startupContext,
-			serviceNodeName,
-			upstreamNodeName,
-		)
-		if loadErr != nil {
-			cancel()
-
-			return nil, loadErr
+		service, err := loadTailscaleNode(serviceNodes, serviceNodeName)
+		if err != nil {
+			return nil, err
 		}
 
-		nodes.startupCancel = cancel
-		nodes.startupContext = startupContext
-		nodes.serviceNode = serviceNodeName
-		nodes.upstreamNode = upstreamNodeName
+		var upstream *serviceNode
+		if upstreamNodeName != "" {
+			upstream, err = loadTailscaleNode(upstreamNodes, upstreamNodeName)
+			if err != nil {
+				_, cleanupErr := serviceNodes.Delete(serviceNodeName)
 
-		return nodes, nil
+				return nil, errors.Join(err, cleanupErr)
+			}
+		}
+
+		return &gatewayTailscaleNodes{
+			service:      service,
+			serviceNode:  serviceNodeName,
+			upstream:     upstream,
+			upstreamNode: upstreamNodeName,
+		}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -166,85 +159,7 @@ func loadReadyGatewayTailscaleNodes(
 	return nodePair.(*gatewayTailscaleNodes), nil
 }
 
-func createReadyGatewayTailscaleNodes(
-	ctx context.Context,
-	serviceNodeName string,
-	upstreamNodeName string,
-) (*gatewayTailscaleNodes, error) {
-
-	type nodeReadinessResult struct {
-		name string
-		node *serviceNode
-		err  error
-	}
-
-	count := 1
-	if upstreamNodeName != "" {
-		count++
-	}
-
-	results := make(chan nodeReadinessResult, count)
-	loadNode := func(name string, nodes *caddy.UsagePool) {
-		node, err := loadReadyTailscaleNodeBeforeDeadline(ctx, nodes, name)
-		results <- nodeReadinessResult{name: name, node: node, err: err}
-	}
-
-	go loadNode(serviceNodeName, serviceNodes)
-	if upstreamNodeName != "" {
-		go loadNode(upstreamNodeName, upstreamNodes)
-	}
-
-	var service *serviceNode
-	var upstream *serviceNode
-	var readinessErr error
-	for range count {
-		result := <-results
-		if result.err != nil {
-			readinessErr = errors.Join(readinessErr, result.err)
-
-			continue
-		}
-
-		if result.name == serviceNodeName {
-			service = result.node
-
-			continue
-		}
-
-		upstream = result.node
-	}
-
-	if readinessErr != nil {
-		var cleanupErr error
-		if service != nil {
-			_, cleanupErr = serviceNodes.Delete(serviceNodeName)
-		}
-		if upstream != nil {
-			_, upstreamCleanupErr := upstreamNodes.Delete(upstreamNodeName)
-			cleanupErr = errors.Join(cleanupErr, upstreamCleanupErr)
-		}
-
-		return nil, errors.Join(readinessErr, cleanupErr)
-	}
-
-	return &gatewayTailscaleNodes{service: service, upstream: upstream}, nil
-}
-
-func gatewayNodePairKey(serviceNodeName string, upstreamNodeName string) string {
-	return serviceNodeName + "\x00" + upstreamNodeName
-}
-
-func (nodes *gatewayTailscaleNodes) Destruct() error {
-	nodes.startupCancel()
-
-	return releaseTailscaleNodes(nodes.serviceNode, nodes.upstreamNode)
-}
-
-func loadReadyTailscaleNodeBeforeDeadline(
-	ctx context.Context,
-	nodes *caddy.UsagePool,
-	nodeName string,
-) (*serviceNode, error) {
+func loadTailscaleNode(nodes *caddy.UsagePool, nodeName string) (*serviceNode, error) {
 	node, _, err := nodes.LoadOrNew(nodeName, func() (caddy.Destructor, error) {
 		return createServiceNode(nodeName)
 	})
@@ -252,52 +167,15 @@ func loadReadyTailscaleNodeBeforeDeadline(
 		return nil, err
 	}
 
-	serviceNode := node.(*serviceNode)
-	if err := waitForTailscaleNode(ctx, nodeName, serviceNode); err != nil {
-		_, cleanupErr := nodes.Delete(nodeName)
-
-		return nil, errors.Join(err, cleanupErr)
-	}
-
-	return serviceNode, nil
+	return node.(*serviceNode), nil
 }
 
-var waitForTailscaleNode = waitForTailscaleNodeRunning
+func gatewayNodePairKey(serviceNodeName string, upstreamNodeName string) string {
+	return serviceNodeName + "\x00" + upstreamNodeName
+}
 
-func waitForTailscaleNodeRunning(
-	ctx context.Context,
-	nodeName string,
-	node *serviceNode,
-) error {
-	status, err := node.Up(ctx)
-	if err != nil {
-		failureKind := "unavailable"
-		if errors.Is(err, context.DeadlineExceeded) {
-			failureKind = "timeout"
-		}
-		failure := err.Error()
-		if secret := os.Getenv("TS_OAUTH_SECRET"); secret != "" {
-			secret, _, _ = strings.Cut(secret, "?")
-			failure = strings.ReplaceAll(failure, secret, "[redacted]")
-		}
-
-		caddy.Log().Error(
-			"Tailscale node readiness failed",
-			zap.String("node", nodeName),
-			zap.String("failure_kind", failureKind),
-			zap.String("cause", failure),
-		)
-
-		return fmt.Errorf("Tailscale node %s did not reach Running", nodeName)
-	}
-
-	caddy.Log().Info(
-		"Tailscale node ready",
-		zap.String("node", nodeName),
-		zap.Int("address_count", len(status.TailscaleIPs)),
-	)
-
-	return nil
+func (nodes *gatewayTailscaleNodes) Destruct() error {
+	return releaseTailscaleNodes(nodes.serviceNode, nodes.upstreamNode)
 }
 
 func gatewayTailscaleNodeNames() (string, string, error) {
@@ -314,7 +192,7 @@ func gatewayTailscaleNodeNames() (string, string, error) {
 }
 
 type Readiness struct {
-	client           *local.Client
+	node             *serviceNode
 	serviceName      string
 	serviceNodeName  string
 	upstreamNodeName string
@@ -349,19 +227,18 @@ func (readiness *Readiness) UnmarshalCaddyfile(dispenser *caddyfile.Dispenser) e
 	return nil
 }
 
-func (readiness *Readiness) Provision(ctx caddy.Context) error {
+func (readiness *Readiness) Provision(_ caddy.Context) error {
 	serviceNodeName, upstreamNodeName, err := gatewayTailscaleNodeNames()
 	if err != nil {
 		return err
 	}
 
-	nodes, err := loadReadyGatewayTailscaleNodes(ctx, serviceNodeName, upstreamNodeName)
+	nodes, err := loadGatewayTailscaleNodes(serviceNodeName, upstreamNodeName)
 	if err != nil {
 		return err
 	}
 
-	// Up completed Start, so LocalClient is guaranteed to succeed.
-	readiness.client, _ = nodes.service.LocalClient()
+	readiness.node = nodes.service
 	readiness.serviceName = os.Getenv("TAILSCALE_SERVICE_NAME")
 
 	readiness.serviceNodeName = serviceNodeName
@@ -383,7 +260,12 @@ func (readiness Readiness) ServeHTTP(
 	r *http.Request,
 	next caddyhttp.Handler,
 ) error {
-	ready, err := writeServiceAddresses(r.Context(), readiness.client, "", readiness.serviceName)
+	client, err := readiness.node.LocalClient()
+	if err != nil {
+		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("Tailscale service node is unavailable"))
+	}
+
+	ready, err := writeServiceAddresses(r.Context(), client, "", readiness.serviceName)
 	if err != nil {
 		return caddyhttp.Error(http.StatusServiceUnavailable, err)
 	}
@@ -413,8 +295,81 @@ func releaseTailscaleNodes(serviceNodeName string, upstreamNodeName string) erro
 
 type serviceNode struct {
 	*tsnet.Server
+	serverMu        sync.Mutex
+	closed          bool
 	publisherMu     sync.Mutex
 	publisherCancel context.CancelFunc
+}
+
+func (node *serviceNode) startedServer() (*tsnet.Server, error) {
+	node.serverMu.Lock()
+	defer node.serverMu.Unlock()
+
+	if node.closed {
+		return nil, net.ErrClosed
+	}
+
+	server := node.Server
+	if err := server.Start(); err != nil {
+		closeErr := server.Close()
+		replacement, replacementErr := createServiceNode(server.Hostname)
+		if replacementErr == nil {
+			node.Server = replacement.Server
+		}
+
+		return nil, errors.Join(err, closeErr, replacementErr)
+	}
+
+	return server, nil
+}
+
+func (node *serviceNode) Up(ctx context.Context) (*ipnstate.Status, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.Up(ctx)
+}
+
+func (node *serviceNode) LocalClient() (*local.Client, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.LocalClient()
+}
+
+func (node *serviceNode) ListenService(name string, mode tsnet.ServiceMode) (*tsnet.ServiceListener, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.ListenService(name, mode)
+}
+
+func (node *serviceNode) Dial(ctx context.Context, network string, address string) (net.Conn, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.Dial(ctx, network, address)
+}
+
+func (node *serviceNode) Close() error {
+	node.serverMu.Lock()
+	defer node.serverMu.Unlock()
+
+	if node.closed {
+		return net.ErrClosed
+	}
+
+	node.closed = true
+
+	return node.Server.Close()
 }
 
 func createServiceNode(name string) (*serviceNode, error) {
@@ -464,6 +419,234 @@ type acceptedConnection struct {
 	err        error
 }
 
+type retryingServiceListener struct {
+	serviceMode   tsnet.ServiceModeTCP
+	serviceName   string
+	node          *serviceNode
+	publish       func()
+	listen        func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error)
+	retryInterval time.Duration
+
+	closed       chan struct{}
+	closeOnce    sync.Once
+	mu           sync.Mutex
+	listener     net.Listener
+	registration *serviceRegistration
+}
+
+func newRetryingServiceListener(
+	node *serviceNode,
+	serviceName string,
+	serviceMode tsnet.ServiceModeTCP,
+	publish func(),
+) *retryingServiceListener {
+	return &retryingServiceListener{
+		serviceMode: serviceMode,
+		serviceName: serviceName,
+		node:        node,
+		publish:     publish,
+		listen: func(node *serviceNode, name string, mode tsnet.ServiceModeTCP) (net.Listener, error) {
+			return node.ListenService(name, mode)
+		},
+		retryInterval: servicePublicationInterval,
+		closed:        make(chan struct{}),
+	}
+}
+
+func (listener *retryingServiceListener) Accept() (net.Conn, error) {
+	for {
+		active, err := listener.activeListener()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil, net.ErrClosed
+			}
+
+			caddy.Log().Warn(
+				"Tailscale service listener unavailable; retrying",
+				zap.String("service", listener.serviceName),
+				zap.Error(err),
+			)
+
+			if !listener.waitForRetry() {
+				return nil, net.ErrClosed
+			}
+
+			continue
+		}
+
+		connection, acceptErr := active.Accept()
+		if acceptErr == nil {
+			return connection, nil
+		}
+
+		if errors.Is(acceptErr, net.ErrClosed) && listener.isClosed() {
+			return nil, net.ErrClosed
+		}
+
+		var networkError net.Error
+		if errors.As(acceptErr, &networkError) && networkError.Temporary() {
+			caddy.Log().Warn(
+				"Tailscale service accept temporarily unavailable; retrying",
+				zap.String("service", listener.serviceName),
+				zap.Error(acceptErr),
+			)
+
+			if !listener.waitForRetry() {
+				return nil, net.ErrClosed
+			}
+
+			continue
+		}
+
+		cleanupErr := listener.clear(active)
+		caddy.Log().Warn(
+			"Tailscale service listener stopped; retrying",
+			zap.String("service", listener.serviceName),
+			zap.Error(errors.Join(acceptErr, cleanupErr)),
+		)
+	}
+}
+
+type serviceRegistration struct {
+	done chan struct{}
+	err  error
+}
+
+func (listener *retryingServiceListener) activeListener() (net.Listener, error) {
+	for {
+		listener.mu.Lock()
+		if listener.isClosed() {
+			listener.mu.Unlock()
+
+			return nil, net.ErrClosed
+		}
+
+		if listener.listener != nil {
+			active := listener.listener
+			listener.mu.Unlock()
+
+			return active, nil
+		}
+
+		registration := listener.registration
+		if registration == nil {
+			registration = &serviceRegistration{done: make(chan struct{})}
+			listener.registration = registration
+			go listener.register(registration)
+		}
+		listener.mu.Unlock()
+
+		select {
+		case <-listener.closed:
+			return nil, net.ErrClosed
+		case <-registration.done:
+		}
+
+		if registration.err != nil {
+			return nil, registration.err
+		}
+	}
+}
+
+func (listener *retryingServiceListener) register(registration *serviceRegistration) {
+	defer close(registration.done)
+
+	created, err := listener.listen(
+		listener.node, listener.serviceName, listener.serviceMode,
+	)
+
+	listener.mu.Lock()
+	registration.err = err
+	listener.registration = nil
+
+	if listener.isClosed() {
+		if created != nil {
+			_ = created.Close()
+		}
+
+		registration.err = net.ErrClosed
+	} else if err == nil {
+		listener.listener = created
+	}
+	listener.mu.Unlock()
+
+	if registration.err == nil && listener.publish != nil {
+		listener.publish()
+	}
+}
+
+func (listener *retryingServiceListener) waitForRetry() bool {
+	timer := time.NewTimer(listener.retryInterval)
+	defer timer.Stop()
+
+	select {
+	case <-listener.closed:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (listener *retryingServiceListener) clear(active net.Listener) error {
+	listener.mu.Lock()
+	defer listener.mu.Unlock()
+
+	if listener.listener == active {
+		closeErr := active.Close()
+		listener.listener = nil
+
+		return closeErr
+	}
+
+	return nil
+}
+
+func (listener *retryingServiceListener) Close() error {
+	var closeErr error
+	listener.closeOnce.Do(func() {
+		close(listener.closed)
+
+		listener.mu.Lock()
+		defer listener.mu.Unlock()
+
+		if listener.listener != nil {
+			closeErr = listener.listener.Close()
+		}
+	})
+
+	return closeErr
+}
+
+func (listener *retryingServiceListener) Addr() net.Addr {
+	listener.mu.Lock()
+	defer listener.mu.Unlock()
+
+	if listener.listener != nil {
+		return listener.listener.Addr()
+	}
+
+	return retryingServiceAddress(listener.serviceName)
+}
+
+func (listener *retryingServiceListener) isClosed() bool {
+	select {
+	case <-listener.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+type retryingServiceAddress string
+
+func (address retryingServiceAddress) Network() string {
+	return "tailscale-service"
+}
+
+func (address retryingServiceAddress) String() string {
+	return string(address)
+}
+
 type sharedServiceListener struct {
 	net.Listener
 	key       string
@@ -505,7 +688,11 @@ func (listener *sharedServiceListener) start() {
 }
 
 func (listener *sharedServiceListener) Destruct() error {
-	listener.start()
+	listener.startOnce.Do(func() {
+		listener.accepted = make(chan acceptedConnection)
+		listener.done = make(chan struct{})
+		close(listener.accepted)
+	})
 	close(listener.done)
 
 	return listener.Listener.Close()
@@ -559,40 +746,6 @@ func (listener *serviceListener) Close() error {
 
 func (listener *serviceListener) Unwrap() net.Listener {
 	return listener.Listener
-}
-
-func listenBeforeDeadline(ctx context.Context, listen func() (net.Listener, error)) (net.Listener, error) {
-	result := make(chan acceptedListener)
-	go func() {
-		listener, err := listen()
-		select {
-		case result <- acceptedListener{listener: listener, err: err}:
-		case <-ctx.Done():
-			if listener != nil {
-				_ = listener.Close()
-			}
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case accepted := <-result:
-		if ctx.Err() != nil {
-			if accepted.listener != nil {
-				_ = accepted.listener.Close()
-			}
-
-			return nil, ctx.Err()
-		}
-
-		return accepted.listener, accepted.err
-	}
-}
-
-type acceptedListener struct {
-	listener net.Listener
-	err      error
 }
 
 func writeServiceAddresses(
@@ -673,8 +826,12 @@ func (node *serviceNode) publishServiceAddresses(
 		return
 	}
 
-	// Node provisioning has completed Up, which initializes and retains this client.
-	client, _ := node.LocalClient()
+	client, err := node.LocalClient()
+	if err != nil {
+		caddy.Log().Error("start Tailscale service address publication", zap.Error(err))
+
+		return
+	}
 
 	publisherContext, cancel := context.WithCancel(context.Background())
 	node.publisherCancel = cancel
