@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
@@ -90,4 +91,61 @@ func publicationNode(t *testing.T, routed bool) *serviceNode {
 	client.Dial = external.Dial
 
 	return node
+}
+
+type closeNotifyingListener struct {
+	net.Listener
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (listener *closeNotifyingListener) Close() error {
+	err := listener.Listener.Close()
+	listener.once.Do(func() { close(listener.closed) })
+
+	return err
+}
+
+type blockedServiceRegistration struct {
+	listener    *retryingServiceListener
+	created     *closeNotifyingListener
+	attempts    atomic.Int32
+	started     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func newBlockedServiceRegistration(t *testing.T) *blockedServiceRegistration {
+	t.Helper()
+	service, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registration := &blockedServiceRegistration{
+		created: &closeNotifyingListener{Listener: service, closed: make(chan struct{})},
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	registration.listener = newRetryingServiceListener(
+		&serviceNode{Server: &tsnet.Server{}}, string(publicationServiceName),
+		tsnet.ServiceModeTCP{Port: 443}, nil,
+	)
+	registration.listener.listen = func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error) {
+		registration.attempts.Add(1)
+		select {
+		case registration.started <- struct{}{}:
+		default:
+		}
+		<-registration.release
+
+		return registration.created, nil
+	}
+	t.Cleanup(func() {
+		_ = registration.listener.Close()
+		registration.releaseOnce.Do(func() { close(registration.release) })
+		_ = registration.created.Close()
+	})
+
+	return registration
 }

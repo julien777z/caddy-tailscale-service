@@ -3,6 +3,7 @@ package caddytailscaleservice
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -472,5 +473,55 @@ func TestServiceNodeReplacesCachedStartupFailure(t *testing.T) {
 	}
 	if node.Server != closedServer {
 		t.Fatal("closed lifecycle replaced the SDK instance")
+	}
+}
+
+func TestPendingRegistrationClosure(t *testing.T) {
+	for _, waiters := range []int{1, 8} {
+		t.Run(fmt.Sprintf("waiters=%d", waiters), func(t *testing.T) {
+			registration := newBlockedServiceRegistration(t)
+			results := make(chan error, waiters)
+			for range waiters {
+				go func() {
+					connection, err := registration.listener.Accept()
+					if connection != nil {
+						_ = connection.Close()
+					}
+					results <- err
+				}()
+			}
+
+			select {
+			case <-registration.started:
+			case <-time.After(time.Second):
+				t.Fatal("service registration did not start")
+			}
+			time.Sleep(50 * time.Millisecond)
+
+			if got := registration.attempts.Load(); got != 1 {
+				t.Fatalf("pending registration attempts=%d, want one", got)
+			}
+			if err := registration.listener.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			for range waiters {
+				select {
+				case err := <-results:
+					if !errors.Is(err, net.ErrClosed) {
+						t.Fatalf("closed registration returned %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("closure kept a service waiter blocked")
+				}
+			}
+
+			registration.releaseOnce.Do(func() { close(registration.release) })
+			select {
+			case <-registration.created.closed:
+			case <-time.After(time.Second):
+				t.Fatal("late service listener was not closed")
+			}
+		})
 	}
 }
