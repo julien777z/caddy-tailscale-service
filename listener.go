@@ -441,6 +441,7 @@ type retryingServiceListener struct {
 	serviceName string
 	node        *serviceNode
 	publish     func()
+	listen      func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error)
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -459,6 +460,7 @@ func newRetryingServiceListener(
 		serviceName: serviceName,
 		node:        node,
 		publish:     publish,
+		listen:      listenTailscaleService,
 		closed:      make(chan struct{}),
 	}
 }
@@ -514,7 +516,7 @@ func (listener *retryingServiceListener) activeListener() (net.Listener, error) 
 	defer cancel()
 
 	created, err := listenBeforeDeadline(startupContext, func() (net.Listener, error) {
-		return listenTailscaleService(listener.node, listener.serviceName, listener.serviceMode)
+		return listener.listen(listener.node, listener.serviceName, listener.serviceMode)
 	})
 	if err != nil {
 		return nil, err
@@ -653,7 +655,11 @@ func (listener *sharedServiceListener) start() {
 }
 
 func (listener *sharedServiceListener) Destruct() error {
-	listener.start()
+	listener.startOnce.Do(func() {
+		listener.accepted = make(chan acceptedConnection)
+		listener.done = make(chan struct{})
+		close(listener.accepted)
+	})
 	close(listener.done)
 
 	return listener.Listener.Close()
