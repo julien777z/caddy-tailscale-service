@@ -6,7 +6,7 @@ Expose Caddy through Tailscale Services and reach upstreams over the tailnet.
 
 - TCP service listeners with optional PROXY protocol v2.
 - TLS and plaintext reverse-proxy transports, with service discovery and timeout recovery.
-- Single-node or paired service/upstream startup under one readiness deadline.
+- Lazy service/upstream startup with listener recovery in the running process.
 - Direct user identity, capability checks, and trusted proxy identity forwarding.
 - Atomic IPv4 service-address publication after primary-route activation.
 

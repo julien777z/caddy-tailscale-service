@@ -192,7 +192,6 @@ func gatewayTailscaleNodeNames() (string, string, error) {
 }
 
 type Readiness struct {
-	client           *local.Client
 	node             *serviceNode
 	serviceName      string
 	serviceNodeName  string
@@ -261,17 +260,9 @@ func (readiness Readiness) ServeHTTP(
 	r *http.Request,
 	next caddyhttp.Handler,
 ) error {
-	client := readiness.client
-	if client == nil {
-		if readiness.node == nil {
-			return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("Tailscale service node is unavailable"))
-		}
-
-		var err error
-		client, err = readiness.node.LocalClient()
-		if err != nil {
-			return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("Tailscale service node is unavailable"))
-		}
+	client, err := readiness.node.LocalClient()
+	if err != nil {
+		return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("Tailscale service node is unavailable"))
 	}
 
 	ready, err := writeServiceAddresses(r.Context(), client, "", readiness.serviceName)
@@ -436,10 +427,11 @@ type retryingServiceListener struct {
 	listen        func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error)
 	retryInterval time.Duration
 
-	closed    chan struct{}
-	closeOnce sync.Once
-	mu        sync.Mutex
-	listener  net.Listener
+	closed       chan struct{}
+	closeOnce    sync.Once
+	mu           sync.Mutex
+	listener     net.Listener
+	registration *serviceRegistration
 }
 
 func newRetryingServiceListener(
@@ -474,6 +466,7 @@ func (listener *retryingServiceListener) Accept() (net.Conn, error) {
 				zap.String("service", listener.serviceName),
 				zap.Error(err),
 			)
+
 			if !listener.waitForRetry() {
 				return nil, net.ErrClosed
 			}
@@ -485,6 +478,7 @@ func (listener *retryingServiceListener) Accept() (net.Conn, error) {
 		if acceptErr == nil {
 			return connection, nil
 		}
+
 		if errors.Is(acceptErr, net.ErrClosed) && listener.isClosed() {
 			return nil, net.ErrClosed
 		}
@@ -498,42 +492,66 @@ func (listener *retryingServiceListener) Accept() (net.Conn, error) {
 	}
 }
 
+type serviceRegistration struct {
+	done     chan struct{}
+	listener net.Listener
+	err      error
+}
+
 func (listener *retryingServiceListener) activeListener() (net.Listener, error) {
 	listener.mu.Lock()
+	if listener.isClosed() {
+		listener.mu.Unlock()
+
+		return nil, net.ErrClosed
+	}
+
 	if listener.listener != nil {
 		active := listener.listener
 		listener.mu.Unlock()
 
 		return active, nil
 	}
+
+	registration := listener.registration
+	if registration == nil {
+		registration = &serviceRegistration{done: make(chan struct{})}
+		listener.registration = registration
+		go listener.register(registration)
+	}
 	listener.mu.Unlock()
 
-	startupContext, cancel := context.WithTimeout(context.Background(), servicePublicationTimeout)
-	defer cancel()
-
-	created, err := listenBeforeDeadline(startupContext, func() (net.Listener, error) {
-		return listener.listen(listener.node, listener.serviceName, listener.serviceMode)
-	})
-	if err != nil {
-		return nil, err
+	select {
+	case <-listener.closed:
+		return nil, net.ErrClosed
+	case <-registration.done:
 	}
 
 	listener.mu.Lock()
 	if listener.isClosed() {
 		listener.mu.Unlock()
-		_ = created.Close()
 
 		return nil, net.ErrClosed
 	}
+
 	if listener.listener != nil {
 		active := listener.listener
 		listener.mu.Unlock()
-		_ = created.Close()
 
 		return active, nil
 	}
 
-	listener.listener = created
+	if listener.registration == registration {
+		listener.registration = nil
+	}
+
+	if registration.err != nil {
+		listener.mu.Unlock()
+
+		return nil, registration.err
+	}
+
+	listener.listener = registration.listener
 	publish := listener.publish
 	listener.mu.Unlock()
 
@@ -541,7 +559,26 @@ func (listener *retryingServiceListener) activeListener() (net.Listener, error) 
 		publish()
 	}
 
-	return created, nil
+	return registration.listener, nil
+}
+
+func (listener *retryingServiceListener) register(registration *serviceRegistration) {
+	defer close(registration.done)
+
+	created, err := listener.listen(
+		listener.node, listener.serviceName, listener.serviceMode,
+	)
+
+	listener.mu.Lock()
+	defer listener.mu.Unlock()
+
+	registration.listener = created
+	registration.err = err
+
+	if listener.isClosed() && registration.listener != nil {
+		_ = registration.listener.Close()
+		registration.err = net.ErrClosed
+	}
 }
 
 func (listener *retryingServiceListener) waitForRetry() bool {
@@ -572,8 +609,11 @@ func (listener *retryingServiceListener) Close() error {
 
 		listener.mu.Lock()
 		defer listener.mu.Unlock()
+
 		if listener.listener != nil {
 			closeErr = listener.listener.Close()
+		} else if listener.registration != nil && listener.registration.listener != nil {
+			closeErr = listener.registration.listener.Close()
 		}
 	})
 
@@ -709,40 +749,6 @@ func (listener *serviceListener) Close() error {
 
 func (listener *serviceListener) Unwrap() net.Listener {
 	return listener.Listener
-}
-
-func listenBeforeDeadline(ctx context.Context, listen func() (net.Listener, error)) (net.Listener, error) {
-	result := make(chan acceptedListener)
-	go func() {
-		listener, err := listen()
-		select {
-		case result <- acceptedListener{listener: listener, err: err}:
-		case <-ctx.Done():
-			if listener != nil {
-				_ = listener.Close()
-			}
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case accepted := <-result:
-		if ctx.Err() != nil {
-			if accepted.listener != nil {
-				_ = accepted.listener.Close()
-			}
-
-			return nil, ctx.Err()
-		}
-
-		return accepted.listener, accepted.err
-	}
-}
-
-type acceptedListener struct {
-	listener net.Listener
-	err      error
 }
 
 func writeServiceAddresses(

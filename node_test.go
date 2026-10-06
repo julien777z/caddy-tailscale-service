@@ -399,6 +399,7 @@ func TestRetryingServiceListenerRecoversFromRegistrationFailure(t *testing.T) {
 	for attempts.Load() < 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
+
 	if attempts.Load() < 2 {
 		t.Fatal("listener did not retry after registration failed")
 	}
@@ -422,43 +423,6 @@ func TestRetryingServiceListenerRecoversFromRegistrationFailure(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("listener did not accept after registration recovered")
-	}
-}
-
-func TestListenerStartupDeadline(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-
-	release := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	returned := make(chan error, 1)
-	go func() {
-		_, err := listenBeforeDeadline(ctx, func() (net.Listener, error) {
-			<-release
-			return listener, nil
-		})
-		returned <- err
-	}()
-	cancel()
-
-	select {
-	case err := <-returned:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("listener ignored cancellation: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("listener creation escaped startup deadline")
-	}
-	close(release)
-
-	// The late listener must be closed, not retained after startup cancellation.
-	listener.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second))
-	_, err = listener.Accept()
-	if !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("late listener remained open: %v", err)
 	}
 }
 

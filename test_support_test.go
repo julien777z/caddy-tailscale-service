@@ -14,6 +14,8 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
 	"testing"
+
+	"tailscale.com/tsnet"
 )
 
 func userIdentity() *apitype.WhoIsResponse {
@@ -70,4 +72,22 @@ func (listener *notifyingListener) Accept() (net.Conn, error) {
 	listener.once.Do(func() { close(listener.started) })
 
 	return listener.Listener.Accept()
+}
+
+func publicationNode(t *testing.T, routed bool) *serviceNode {
+	t.Helper()
+	node := &serviceNode{Server: &tsnet.Server{
+		Dir: t.TempDir(), Hostname: "example-readiness", ControlURL: "http://127.0.0.1:1",
+	}}
+	t.Cleanup(func() { _ = node.Close() })
+	client, err := node.LocalClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	external := publicationClient(t, routed)
+	client.OmitAuth = external.OmitAuth
+	client.Dial = external.Dial
+
+	return node
 }
