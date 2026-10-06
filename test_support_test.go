@@ -1,7 +1,6 @@
 package caddytailscaleservice
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,10 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"runtime"
-	"runtime/pprof"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"tailscale.com/client/local"
@@ -253,149 +248,4 @@ func newAcceptRecoveryScenario(t *testing.T, temporary bool) *acceptRecoveryScen
 	})
 
 	return scenario
-}
-
-type gatedCloseListener struct {
-	*closeNotifyingListener
-	started     chan struct{}
-	release     chan struct{}
-	gateOnce    sync.Once
-	releaseOnce sync.Once
-}
-
-func (listener *gatedCloseListener) Close() error {
-	listener.gateOnce.Do(func() {
-		close(listener.started)
-		<-listener.release
-	})
-
-	return listener.closeNotifyingListener.Close()
-}
-
-func (listener *gatedCloseListener) releaseClose() {
-	listener.releaseOnce.Do(func() { close(listener.release) })
-}
-
-type activeListenerResult struct {
-	listener net.Listener
-	err      error
-}
-
-type registrationReplacementScenario struct {
-	listener               *retryingServiceListener
-	first                  *gatedCloseListener
-	replacement            *closeNotifyingListener
-	firstStarted           chan struct{}
-	replacementStarted     chan struct{}
-	releaseFirst           chan struct{}
-	releaseReplacement     chan struct{}
-	releaseFirstOnce       sync.Once
-	releaseReplacementOnce sync.Once
-	attempts               atomic.Int32
-}
-
-func newRegistrationReplacementScenario(t *testing.T) *registrationReplacementScenario {
-	t.Helper()
-	previousParallelism := runtime.GOMAXPROCS(1)
-	t.Cleanup(func() { runtime.GOMAXPROCS(previousParallelism) })
-
-	first, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	replacement, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		_ = first.Close()
-		t.Fatal(err)
-	}
-
-	scenario := &registrationReplacementScenario{
-		first: &gatedCloseListener{
-			closeNotifyingListener: &closeNotifyingListener{Listener: first, closed: make(chan struct{})},
-			started:                make(chan struct{}), release: make(chan struct{}),
-		},
-		replacement:  &closeNotifyingListener{Listener: replacement, closed: make(chan struct{})},
-		firstStarted: make(chan struct{}), replacementStarted: make(chan struct{}),
-		releaseFirst: make(chan struct{}), releaseReplacement: make(chan struct{}),
-	}
-	scenario.listener = newRetryingServiceListener(
-		&serviceNode{Server: &tsnet.Server{}}, string(publicationServiceName),
-		tsnet.ServiceModeTCP{Port: 443}, nil,
-	)
-	scenario.listener.listen = func(*serviceNode, string, tsnet.ServiceModeTCP) (net.Listener, error) {
-		if scenario.attempts.Add(1) == 1 {
-			close(scenario.firstStarted)
-			<-scenario.releaseFirst
-
-			return scenario.first, nil
-		}
-
-		close(scenario.replacementStarted)
-		<-scenario.releaseReplacement
-
-		return scenario.replacement, nil
-	}
-	t.Cleanup(func() {
-		scenario.first.releaseClose()
-		scenario.releaseFirstOnce.Do(func() { close(scenario.releaseFirst) })
-		scenario.releaseReplacementOnce.Do(func() { close(scenario.releaseReplacement) })
-		_ = scenario.listener.Close()
-		_ = scenario.first.Close()
-		_ = scenario.replacement.Close()
-	})
-
-	return scenario
-}
-
-func waitForReaderPhase(t *testing.T, label string, mutex bool, results <-chan activeListenerResult) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		select {
-		case result := <-results:
-			t.Fatalf("reader %s returned obsolete registration while replacement pending: %v", label, result.err)
-		default:
-		}
-
-		var profile bytes.Buffer
-		if err := pprof.Lookup("goroutine").WriteTo(&profile, 1); err != nil {
-			t.Fatal(err)
-		}
-
-		for _, block := range strings.Split(profile.String(), "\n\n") {
-			if !strings.Contains(block, `"registration-reader":"`+label+`"`) || !strings.Contains(block, "activeListener") {
-				continue
-			}
-
-			locked, waiting := false, false
-			stack := strings.SplitN(block, "\n", 2)[0]
-			for _, address := range strings.Fields(strings.SplitN(stack, "@", 2)[1]) {
-				pc, err := strconv.ParseUint(address, 0, 64)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				frame := runtime.FuncForPC(uintptr(pc - 1))
-				if frame == nil {
-					t.Fatalf("profile address %s has no function", address)
-				}
-
-				locked = locked || strings.Contains(frame.Name(), "lockSlow")
-				waiting = waiting || frame.Name() == "runtime.selectgo"
-			}
-			if (mutex && locked) || (!mutex && waiting && !locked) {
-				return
-			}
-		}
-		runtime.Gosched()
-	}
-
-	var profile bytes.Buffer
-	_ = pprof.Lookup("goroutine").WriteTo(&profile, 1)
-	t.Fatalf("reader %s did not reach observed mutex=%t phase:\n%s", label, mutex, profile.String())
-}
-
-func runRegistrationReader(label string, operation func()) {
-	pprof.Do(context.Background(), pprof.Labels("registration-reader", label), func(context.Context) { operation() })
 }

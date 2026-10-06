@@ -508,9 +508,8 @@ func (listener *retryingServiceListener) Accept() (net.Conn, error) {
 }
 
 type serviceRegistration struct {
-	done     chan struct{}
-	listener net.Listener
-	err      error
+	done chan struct{}
+	err  error
 }
 
 func (listener *retryingServiceListener) activeListener() (net.Listener, error) {
@@ -543,43 +542,9 @@ func (listener *retryingServiceListener) activeListener() (net.Listener, error) 
 		case <-registration.done:
 		}
 
-		listener.mu.Lock()
-		if listener.isClosed() {
-			listener.mu.Unlock()
-
-			return nil, net.ErrClosed
-		}
-
-		if listener.listener != nil {
-			active := listener.listener
-			listener.mu.Unlock()
-
-			return active, nil
-		}
-
-		if listener.registration != registration {
-			listener.mu.Unlock()
-
-			continue
-		}
-
-		listener.registration = nil
-
 		if registration.err != nil {
-			listener.mu.Unlock()
-
 			return nil, registration.err
 		}
-
-		listener.listener = registration.listener
-		publish := listener.publish
-		listener.mu.Unlock()
-
-		if publish != nil {
-			publish()
-		}
-
-		return registration.listener, nil
 	}
 }
 
@@ -591,14 +556,22 @@ func (listener *retryingServiceListener) register(registration *serviceRegistrat
 	)
 
 	listener.mu.Lock()
-	defer listener.mu.Unlock()
-
-	registration.listener = created
 	registration.err = err
+	listener.registration = nil
 
-	if listener.isClosed() && registration.listener != nil {
-		_ = registration.listener.Close()
+	if listener.isClosed() {
+		if created != nil {
+			_ = created.Close()
+		}
+
 		registration.err = net.ErrClosed
+	} else if err == nil {
+		listener.listener = created
+	}
+	listener.mu.Unlock()
+
+	if registration.err == nil && listener.publish != nil {
+		listener.publish()
 	}
 }
 
@@ -638,8 +611,6 @@ func (listener *retryingServiceListener) Close() error {
 
 		if listener.listener != nil {
 			closeErr = listener.listener.Close()
-		} else if listener.registration != nil && listener.registration.listener != nil {
-			closeErr = listener.registration.listener.Close()
 		}
 	})
 
