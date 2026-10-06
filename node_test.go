@@ -499,7 +499,12 @@ func TestServiceNodeReplacesCachedStartupFailure(t *testing.T) {
 	if err := node.Close(); err != nil {
 		t.Fatal(err)
 	}
+	closedServer := node.Server
+
 	if _, err := node.LocalClient(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed lifecycle retried initialization: %v", err)
+	}
+	if node.Server != closedServer {
+		t.Fatal("closed lifecycle replaced the SDK instance")
 	}
 }

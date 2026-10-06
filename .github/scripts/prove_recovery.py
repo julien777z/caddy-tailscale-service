@@ -28,7 +28,7 @@ def main() -> None:
         (
             "if node.closed {\n\t\treturn nil, net.ErrClosed\n\t}",
             "if false {\n\t\treturn nil, net.ErrClosed\n\t}",
-            "closed lifecycle retried initialization",
+            "closed lifecycle replaced the SDK instance",
         ),
     ]
 
