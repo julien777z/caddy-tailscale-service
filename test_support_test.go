@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -367,8 +368,22 @@ func waitForReaderPhase(t *testing.T, label string, mutex bool, results <-chan a
 				continue
 			}
 
-			locked := strings.Contains(block, "lockSlow")
-			waiting := strings.Contains(block, "runtime.selectgo")
+			locked, waiting := false, false
+			stack := strings.SplitN(block, "\n", 2)[0]
+			for _, address := range strings.Fields(strings.SplitN(stack, "@", 2)[1]) {
+				pc, err := strconv.ParseUint(address, 0, 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				frame := runtime.FuncForPC(uintptr(pc - 1))
+				if frame == nil {
+					t.Fatalf("profile address %s has no function", address)
+				}
+
+				locked = locked || strings.Contains(frame.Name(), "lockSlow")
+				waiting = waiting || frame.Name() == "runtime.selectgo"
+			}
 			if (mutex && locked) || (!mutex && waiting && !locked) {
 				return
 			}
