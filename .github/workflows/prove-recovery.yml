@@ -1,0 +1,20 @@
+name: Prove Recovery Regression
+
+on:
+  push:
+    branches: [codex/retry-service-listener]
+
+permissions:
+  contents: read
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Prove SDK Lifecycle Regression
+        run: python3 .github/scripts/prove_recovery.py
