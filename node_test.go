@@ -598,6 +598,17 @@ func TestRegistrationReplacement(t *testing.T) {
 	scenario := newRegistrationReplacementScenario(t)
 	leading := make(chan activeListenerResult, 1)
 	lagging := make(chan activeListenerResult, 1)
+	go runRegistrationReader("lagging", func() {
+		active, err := scenario.listener.activeListener()
+		lagging <- activeListenerResult{listener: active, err: err}
+	})
+	select {
+	case <-scenario.firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial registration did not start")
+	}
+	waitForReaderPhase(t, "lagging", false, nil)
+
 	go runRegistrationReader("leading", func() {
 		active, err := scenario.listener.activeListener()
 		if err != nil {
@@ -613,18 +624,7 @@ func TestRegistrationReplacement(t *testing.T) {
 		active, err = scenario.listener.activeListener()
 		leading <- activeListenerResult{listener: active, err: err}
 	})
-	select {
-	case <-scenario.firstStarted:
-	case <-time.After(time.Second):
-		t.Fatal("initial registration did not start")
-	}
 	waitForReaderPhase(t, "leading", false, nil)
-
-	go runRegistrationReader("lagging", func() {
-		active, err := scenario.listener.activeListener()
-		lagging <- activeListenerResult{listener: active, err: err}
-	})
-	waitForReaderPhase(t, "lagging", false, nil)
 
 	scenario.releaseFirstOnce.Do(func() { close(scenario.releaseFirst) })
 	select {
