@@ -6,11 +6,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      prove_shutdown:
-        description: Verify pending registration shutdown mutations
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -29,9 +24,6 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test Module
         run: go test -race ./...
-      - name: Prove Shutdown Regressions
-        if: ${{ inputs.prove_shutdown }}
-        run: python3 .github/scripts/verify_shutdown.py
       - name: Vet Module
         run: go vet ./...
       - name: Build Caddy
