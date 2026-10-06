@@ -164,6 +164,25 @@ func TestServiceListenerDefersTailscaleRegistration(t *testing.T) {
 	t.Setenv("TAILSCALE_SERVICE_NAME", "svc:example-staging")
 	t.Setenv("TAILSCALE_SERVICE_NODE_NAME", "example-staging-internal-proxy-host")
 
+	blockedState := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedState, []byte("occupied"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeName := os.Getenv("TAILSCALE_SERVICE_NODE_NAME")
+	failedServer := &tsnet.Server{Hostname: nodeName, Dir: blockedState}
+	if err := failedServer.Start(); err == nil {
+		t.Fatal("SDK accepted a state path that is a file")
+	}
+
+	node := &serviceNode{Server: failedServer}
+	if _, _, err := serviceNodes.LoadOrNew(nodeName, func() (caddy.Destructor, error) {
+		return node, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = serviceNodes.Delete(nodeName) })
+
 	loaded, err := getServiceListener(context.Background(), "", "", "443", 0, net.ListenConfig{})
 	if err != nil {
 		t.Fatalf("getServiceListener returned an error: %v", err)
