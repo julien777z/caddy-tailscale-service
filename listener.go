@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 	"tailscale.com/client/local"
 	_ "tailscale.com/feature/oauthkey"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
@@ -303,8 +304,81 @@ func releaseTailscaleNodes(serviceNodeName string, upstreamNodeName string) erro
 
 type serviceNode struct {
 	*tsnet.Server
+	serverMu        sync.Mutex
+	closed          bool
 	publisherMu     sync.Mutex
 	publisherCancel context.CancelFunc
+}
+
+func (node *serviceNode) startedServer() (*tsnet.Server, error) {
+	node.serverMu.Lock()
+	defer node.serverMu.Unlock()
+
+	if node.closed {
+		return nil, net.ErrClosed
+	}
+
+	server := node.Server
+	if err := server.Start(); err != nil {
+		closeErr := server.Close()
+		replacement, replacementErr := createServiceNode(server.Hostname)
+		if replacementErr == nil {
+			node.Server = replacement.Server
+		}
+
+		return nil, errors.Join(err, closeErr, replacementErr)
+	}
+
+	return server, nil
+}
+
+func (node *serviceNode) Up(ctx context.Context) (*ipnstate.Status, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.Up(ctx)
+}
+
+func (node *serviceNode) LocalClient() (*local.Client, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.LocalClient()
+}
+
+func (node *serviceNode) ListenService(name string, mode tsnet.ServiceMode) (*tsnet.ServiceListener, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.ListenService(name, mode)
+}
+
+func (node *serviceNode) Dial(ctx context.Context, network string, address string) (net.Conn, error) {
+	server, err := node.startedServer()
+	if err != nil {
+		return nil, err
+	}
+
+	return server.Dial(ctx, network, address)
+}
+
+func (node *serviceNode) Close() error {
+	node.serverMu.Lock()
+	defer node.serverMu.Unlock()
+
+	if node.closed {
+		return net.ErrClosed
+	}
+
+	node.closed = true
+
+	return node.Server.Close()
 }
 
 func createServiceNode(name string) (*serviceNode, error) {
