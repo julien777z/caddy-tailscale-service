@@ -376,7 +376,9 @@ func waitForReaderPhase(t *testing.T, label string, mutex bool, results <-chan a
 		runtime.Gosched()
 	}
 
-	t.Fatalf("reader %s did not reach observed mutex=%t phase", label, mutex)
+	var profile bytes.Buffer
+	_ = pprof.Lookup("goroutine").WriteTo(&profile, 1)
+	t.Fatalf("reader %s did not reach observed mutex=%t phase:\n%s", label, mutex, profile.String())
 }
 
 func runRegistrationReader(label string, operation func()) {
