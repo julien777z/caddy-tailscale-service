@@ -16,7 +16,7 @@ Build Caddy with a released module version:
 
 ```sh
 xcaddy build v2.11.4 \
-  --with github.com/julien777z/caddy-tailscale-service@v0.1.0
+  --with github.com/julien777z/caddy-tailscale-service@v0.1.1
 ```
 
 Publish a listener using the configured service name and node:
@@ -65,7 +65,7 @@ tailscale_identity {
 }
 ```
 
-Use `tailscale_readiness` on a health endpoint to start the configured nodes when requested
+Use `tailscale_readiness` on a health endpoint to start the service node when requested
 and return HTTP 503 until the service has an active primary route.
 
 ## Configuration
